@@ -83,7 +83,7 @@ async function main(): Promise<void> {
     const query = process.argv[3];
     if (!query) usage();
     const days = Number(option('--days') ?? 7);
-    console.log(share(config, query, days));
+    console.log(await share(config, query, days));
     return;
   }
   if (command === 'keys') {

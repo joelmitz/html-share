@@ -52,17 +52,24 @@ function saveCredentials(value: DeviceCredentials): void {
   chmodSync(file, 0o600);
 }
 
+// pairing済みトークンの読み込み＋apiBase整合検証。requestとpairedDeviceId
+// （publish系: §3「review-client.tsの既存のapiBase整合検証をpublishにも適用」）で共有する。
+function requireCredentials(config: HtmlShareConfig): DeviceCredentials {
+  const saved = loadCredentials();
+  if (!saved) throw new Error('This computer is not paired. Run `html-share review pair <code>`.');
+  if (saved.apiBase !== apiBase(config)) {
+    throw new Error('The paired console does not match this config. Pair this computer again before sending credentials.');
+  }
+  return saved;
+}
+
 async function request(config: HtmlShareConfig, pathname: string, options: {
   method?: string;
   body?: unknown;
   authenticated?: boolean;
 } = {}): Promise<any> {
   const authenticated = options.authenticated !== false;
-  const saved = loadCredentials();
-  if (authenticated && !saved) throw new Error('This computer is not paired. Run `html-share review pair <code>`.');
-  if (authenticated && saved!.apiBase !== apiBase(config)) {
-    throw new Error('The paired console does not match this config. Pair this computer again before sending credentials.');
-  }
+  const saved = authenticated ? requireCredentials(config) : null;
   const serialized = options.body === undefined ? undefined : JSON.stringify(options.body);
   const response = await fetch(`${apiBase(config)}${pathname}`, {
     method: options.method ?? 'GET',
@@ -85,6 +92,14 @@ async function request(config: HtmlShareConfig, pathname: string, options: {
   return payload;
 }
 
+// 名前空間キー＝ペアリング済みデバイスID（設計§3）。サーバーはx-review-device-token
+// から同じ値を導出するため、リクエストボディへ載せる必要はない——CLIがローカルで
+// 必要とするのは、R2への直接アップロード先キー（pages/<deviceId>/<gen>/<slug>/...）を
+// 組み立てるためだけ。
+export function pairedDeviceId(config: HtmlShareConfig): string {
+  return createHash('sha256').update(requireCredentials(config).deviceToken).digest('hex');
+}
+
 // HTTPステータスを保持したエラー。呼び出し側（claimReviews等）が「409=正常な競合」と
 // 「それ以外=本当の失敗（認証切れ・サーバ障害・タイムアウト等）」を区別するために使う。
 // fetch自体の失敗（ネットワーク断・AbortSignal.timeout）はstatusを持たないため
@@ -99,6 +114,55 @@ export async function pair(config: HtmlShareConfig, code: string, name = `Comput
   });
   saveCredentials({ deviceToken: result.deviceToken, deviceName: result.deviceName, apiBase: apiBase(config) });
   return result.deviceName;
+}
+
+export interface PublishLock {
+  token: string;
+  gen: string;
+  expiresAt: number;
+}
+
+// 設計§4.2。取得不可（保持中/purging中）は409/403としてrequest()がそのまま投げる
+// ——publishコマンドは特別扱いせず、他のAPIエラーと同様にコマンド全体を失敗させる。
+export async function acquirePublishLock(config: HtmlShareConfig): Promise<PublishLock> {
+  const result = await request(config, '/device/publish/lock', { method: 'POST', body: {} });
+  return { token: result.token, gen: result.gen, expiresAt: result.expiresAt };
+}
+
+export async function renewPublishLock(config: HtmlShareConfig, lockToken: string): Promise<{ expiresAt: number }> {
+  const result = await request(config, '/device/publish/renew', { method: 'POST', body: { lockToken } });
+  return { expiresAt: result.expiresAt };
+}
+
+export interface CommitPageInput {
+  slug: string;
+  title: string;
+  source: string;
+  repository: string;
+  stream: string;
+  streamLabel: string;
+  date: string;
+  updatedAt: string;
+  bytes: number;
+  md5: string;
+}
+
+// 設計§4.3。object_keyはリクエストに含めない——Workerがlock行のgenとslugから導出する
+// （CLIが他デバイスのprefixや任意のURLを注入する余地が構造的に無い）。
+export async function commitPublish(
+  config: HtmlShareConfig, lockToken: string, pages: CommitPageInput[],
+): Promise<{ pages: number; gcDeleted: number }> {
+  const result = await request(config, '/device/publish/commit', { method: 'POST', body: { lockToken, pages } });
+  return { pages: result.pages, gcDeleted: result.gcDeleted };
+}
+
+// 設計§6。署名主体はWorkerに一本化されるため、CLIはローカル秘密鍵を持たない
+// （scope='public'のみCLIから使う。internal共有は現状owner console側の機能）。
+export async function deviceShare(
+  config: HtmlShareConfig, slug: string, scope: 'public' | 'internal', days: number,
+): Promise<{ url: string; expiresAt: number }> {
+  const result = await request(config, '/device/shares', { method: 'POST', body: { slug, scope, days } });
+  return { url: result.url, expiresAt: result.expiresAt };
 }
 
 export async function pushReviews(config: HtmlShareConfig, sessionId: string, cards: ReviewCard[]): Promise<ReviewCard[]> {

@@ -55,6 +55,11 @@ export interface BuiltPage {
   repository: string;
   stream: string;
   streamLabel: string;
+  // ローカルの構築物内（buildRoot/content/配下）の相対パス。R2上の実際のキーでは
+  // ない——複数マシンpublish対応（設計§4.1）以降、R2キーは deviceId/gen を
+  // publish時に注入して pages/<deviceId>/<gen>/<slug>/index.html として導出する
+  // （publish.tsが行う）。ビルドはオフラインで完結しペアリング状態を要しないため、
+  // ここではdeviceId/genを一切知らない。
   objectKey: string;
 }
 
