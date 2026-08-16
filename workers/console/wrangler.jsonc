@@ -12,7 +12,11 @@
     { "pattern": "html-share-console.example.com", "custom_domain": true }
   ],
   "r2_buckets": [
-    { "binding": "CONSOLE", "bucket_name": "html-share-console" }
+    { "binding": "CONSOLE", "bucket_name": "html-share-console" },
+    // publish lock/commit・世代GC・purgeがcontentバケットのオブジェクトを
+    // list/delete/検証するために必要（CLIのS3 API書き込みとは別に、Worker側の
+    // 管理操作専用）
+    { "binding": "CONTENT", "bucket_name": "html-share-content" }
   ],
   "d1_databases": [
     // database_id は `wrangler d1 create html-share-review` の出力で書き換える
@@ -24,6 +28,9 @@
     "CONSOLE_ORIGIN": "https://html-share-console.example.com",
     "CONTENT_ORIGIN": "https://html-share-content.example.com",
     "MAXIMUM_SHARE_DAYS": "30",
+    // GET /api/owner/pages が本人用リンクをその場で署名する際の有効期間。
+    // 表示のたびに再署名されるため、実質は「開いたタブを放置できる期間」
+    "OWNER_LINK_DAYS": "30",
     "ALLOWED_INTERNAL_CIDRS": "[]",
     // Zero Trust のチーム名（<team>.cloudflareaccess.com）と Access アプリの AUD タグ
     "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",

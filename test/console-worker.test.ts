@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { createSign, generateKeyPairSync } from 'node:crypto';
+import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
 import test from 'node:test';
-import consoleWorker from '../workers/console/src/index.js';
+import consoleWorker, { purgeDeviceObjects } from '../workers/console/src/index.js';
 import contentWorker from '../workers/content/src/index.js';
 import { resetAccessKeyCacheForTests } from '../workers/console/src/access.js';
 import { D1Stub, R2Stub, executionContextStub } from './helpers/d1-stub.ts';
@@ -38,6 +38,7 @@ interface Fixture {
   env: any;
   db: D1Stub;
   consoleBucket: R2Stub;
+  contentBucket: R2Stub;
   context: ExecutionContext;
 }
 
@@ -49,20 +50,64 @@ function fixture(overrides: Record<string, string> = {}): Fixture {
   const consoleBucket = new R2Stub();
   consoleBucket.put('index.html', { body: '<h1>Landing</h1>', contentType: 'text/html; charset=utf-8' });
   consoleBucket.put('app/index.html', { body: '<h1>App</h1>', contentType: 'text/html; charset=utf-8' });
+  const contentBucket = new R2Stub();
   const env = {
     DB: db,
     CONSOLE: consoleBucket,
+    CONTENT: contentBucket,
     SIGNING_PRIVATE_KEY: signing.privateKey,
     OWNER_EMAIL,
     CONSOLE_ORIGIN: CONSOLE,
     CONTENT_ORIGIN: CONTENT,
     MAXIMUM_SHARE_DAYS: '30',
+    OWNER_LINK_DAYS: '30',
     ALLOWED_INTERNAL_CIDRS: '["203.0.113.0/24"]',
     ACCESS_TEAM_DOMAIN: TEAM_DOMAIN,
     ACCESS_AUD: AUD,
     ...overrides,
   };
-  return { env, db, consoleBucket, context: executionContextStub() };
+  return { env, db, consoleBucket, contentBucket, context: executionContextStub() };
+}
+
+// pages/publish系テスト共通のヘルパー。deviceToken保持者として
+// lock→R2直接put（テストなのでS3 API相当を素通り）→commitまで一気に進める。
+async function publishPage(
+  f: Fixture, deviceToken: string, slug: string, html: string,
+  fields: Partial<{ title: string; source: string; repository: string; stream: string; streamLabel: string; date: string; updatedAt: string }> = {},
+): Promise<{ gen: string; objectKey: string; deviceId: string }> {
+  const lockRes = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, {
+      method: 'POST', headers: { 'x-review-device-token': deviceToken },
+    }), f.env, f.context);
+  assert.equal(lockRes.status, 200);
+  const { token: lockToken, gen } = await lockRes.json() as any;
+  const deviceId = (f.db.database.prepare(
+    'SELECT device_id FROM publish_locks WHERE token = ?1',
+  ).get(lockToken) as any).device_id as string;
+  const objectKey = `pages/${deviceId}/${gen}/${slug}/index.html`;
+  f.contentBucket.put(objectKey, { body: html, contentType: 'text/html; charset=utf-8' });
+  const md5 = createHash('md5').update(html).digest('hex');
+  const commitRes = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/commit`, {
+      method: 'POST', headers: { 'x-review-device-token': deviceToken },
+      body: JSON.stringify({
+        lockToken,
+        pages: [{
+          slug,
+          title: fields.title ?? slug,
+          source: fields.source ?? 'https://example.com/repo',
+          repository: fields.repository ?? 'repo',
+          stream: fields.stream ?? 'main',
+          streamLabel: fields.streamLabel ?? 'main',
+          date: fields.date ?? '2026-08-16',
+          updatedAt: fields.updatedAt ?? '2026-08-16T00:00:00.000Z',
+          bytes: Buffer.byteLength(html),
+          md5,
+        }],
+      }),
+    }), f.env, f.context);
+  assert.equal(commitRes.status, 200);
+  return { gen, objectKey, deviceId };
 }
 
 function ownerHeaders(extra: Record<string, string> = {}): Record<string, string> {
@@ -391,10 +436,10 @@ test('preferences round-trip through D1', async () => {
 
 test('owner share URLs interoperate with the content worker', async () => {
   const f = fixture();
-  const contentBucket = new R2Stub();
-  contentBucket.put('pages/demo/index.html', { body: '<h1>Demo</h1>', contentType: 'text/html; charset=utf-8' });
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId } = await publishPage(f, token, 'demo', '<h1>Demo</h1>');
   const contentEnv = {
-    CONTENT: contentBucket,
+    CONTENT: f.contentBucket,
     SIGNING_PUBLIC_KEY: signing.publicKey,
     CONSOLE_ORIGIN: CONSOLE,
   };
@@ -402,7 +447,7 @@ test('owner share URLs interoperate with the content worker', async () => {
   const publicShare = await consoleWorker.fetch(
     new Request(`${CONSOLE}/api/owner/shares`, {
       method: 'POST', headers: ownerHeaders(),
-      body: JSON.stringify({ slug: 'demo', scope: 'public', days: 7 }),
+      body: JSON.stringify({ deviceId, slug: 'demo', scope: 'public', days: 7 }),
     }), f.env, f.context);
   assert.equal(publicShare.status, 201);
   const publicUrl = (await publicShare.json() as any).url;
@@ -412,7 +457,7 @@ test('owner share URLs interoperate with the content worker', async () => {
   const internalShare = await consoleWorker.fetch(
     new Request(`${CONSOLE}/api/owner/shares`, {
       method: 'POST', headers: ownerHeaders(),
-      body: JSON.stringify({ slug: 'demo', scope: 'internal', days: 7 }),
+      body: JSON.stringify({ deviceId, slug: 'demo', scope: 'internal', days: 7 }),
     }), f.env, f.context);
   assert.equal(internalShare.status, 201);
   const internalUrl = (await internalShare.json() as any).url;
@@ -422,30 +467,72 @@ test('owner share URLs interoperate with the content worker', async () => {
   const outside = await contentWorker.fetch(
     new Request(internalUrl, { headers: { 'cf-connecting-ip': '198.51.100.9' } }), contentEnv);
   assert.equal(outside.status, 403);
+
+  // device shares（自端末トークン認証）も同じpages行を署名する
+  const deviceShare = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/shares`, {
+      method: 'POST', headers: { 'x-review-device-token': token },
+      body: JSON.stringify({ slug: 'demo', scope: 'public', days: 7 }),
+    }), f.env, f.context);
+  assert.equal(deviceShare.status, 201);
+  const deviceServed = await contentWorker.fetch(
+    new Request((await deviceShare.json() as any).url), contentEnv);
+  assert.equal(deviceServed.status, 200);
 });
 
 test('owner share validation mirrors the AWS version', async () => {
   const f = fixture({ ALLOWED_INTERNAL_CIDRS: '[]' });
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId } = await publishPage(f, token, 'demo', '<h1>Demo</h1>');
+
+  const missingDeviceId = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/shares`, {
+      method: 'POST', headers: ownerHeaders(),
+      body: JSON.stringify({ slug: 'demo', scope: 'public', days: 7 }),
+    }), f.env, f.context);
+  assert.equal(missingDeviceId.status, 400);
+
   const notConfigured = await consoleWorker.fetch(
     new Request(`${CONSOLE}/api/owner/shares`, {
       method: 'POST', headers: ownerHeaders(),
-      body: JSON.stringify({ slug: 'demo', scope: 'internal', days: 7 }),
+      body: JSON.stringify({ deviceId, slug: 'demo', scope: 'internal', days: 7 }),
     }), f.env, f.context);
   assert.equal(notConfigured.status, 400);
 
   const tooLong = await consoleWorker.fetch(
     new Request(`${CONSOLE}/api/owner/shares`, {
       method: 'POST', headers: ownerHeaders(),
-      body: JSON.stringify({ slug: 'demo', scope: 'public', days: 31 }),
+      body: JSON.stringify({ deviceId, slug: 'demo', scope: 'public', days: 31 }),
     }), f.env, f.context);
   assert.equal(tooLong.status, 400);
 
+  // v4以前と異なり、slugから直接パスを組み立てる経路が無い（D1のpagesを
+  // (deviceId, slug)で引くだけ）ため、不正形式のslugは400ではなく
+  // 「該当ページなし」の404になる。path traversal自体はparameterized
+  // queryにより構造的に無害（クライアント指定文字列がファイルパスへ
+  // 反映される経路が存在しない）
   const badSlug = await consoleWorker.fetch(
     new Request(`${CONSOLE}/api/owner/shares`, {
       method: 'POST', headers: ownerHeaders(),
-      body: JSON.stringify({ slug: '../etc', scope: 'public', days: 7 }),
+      body: JSON.stringify({ deviceId, slug: '../etc', scope: 'public', days: 7 }),
     }), f.env, f.context);
-  assert.equal(badSlug.status, 400);
+  assert.equal(badSlug.status, 404);
+
+  const unknownSlug = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/shares`, {
+      method: 'POST', headers: ownerHeaders(),
+      body: JSON.stringify({ deviceId, slug: 'missing-page', scope: 'public', days: 7 }),
+    }), f.env, f.context);
+  assert.equal(unknownSlug.status, 404);
+
+  // 別デバイスは他人のslugを共有できない(deviceId,slug)の複合キーで隔離される
+  const otherToken = await claimDevice(f, await createPairingCode(f), 'Other PC');
+  const crossDevice = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/shares`, {
+      method: 'POST', headers: { 'x-review-device-token': otherToken },
+      body: JSON.stringify({ slug: 'demo', scope: 'public', days: 7 }),
+    }), f.env, f.context);
+  assert.equal(crossDevice.status, 404);
 });
 
 test('expired tasks are excluded from every listing', async () => {
@@ -509,4 +596,396 @@ test('redirects a directory path with no trailing slash instead of serving it di
   // 拡張子を持つファイルパスは従来どおりそのまま解決される（リダイレクトしない）
   const asset = await consoleWorker.fetch(new Request(`${CONSOLE}/app/index.html`), f.env, f.context);
   assert.equal(asset.status, 401); // JWTを付けていないので認証境界は健在（404でもリダイレクトでもない）
+});
+
+test('publish lock: concurrent second lock is rejected, renew extends TTL, released lock cannot be reused', async () => {
+  const f = fixture();
+  const token = await claimDevice(f, await createPairingCode(f));
+  const headers = { 'x-review-device-token': token };
+
+  const first = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers }), f.env, f.context);
+  assert.equal(first.status, 200);
+  const { token: lockToken, gen } = await first.json() as any;
+  assert.match(gen, /^\d+-[0-9a-f]{16}$/);
+
+  // 保持中の2本目は409（AWS版には無かったStage2固有の排他制御）
+  const second = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers }), f.env, f.context);
+  assert.equal(second.status, 409);
+
+  const renewed = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/renew`, {
+      method: 'POST', headers, body: JSON.stringify({ lockToken }),
+    }), f.env, f.context);
+  assert.equal(renewed.status, 200);
+
+  // renewは保持者本人のtokenでなければ効かない（他端末や失効前ゾンビの横取り防止）
+  const renewWrongToken = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/renew`, {
+      method: 'POST', headers, body: JSON.stringify({ lockToken: 'wrong-token' }),
+    }), f.env, f.context);
+  assert.equal(renewWrongToken.status, 409);
+
+  // 保持中の lockToken 自身で正規にcommitして解放する
+  const html = '<h1>Demo</h1>';
+  const objectKey = `pages/${(f.db.database.prepare('SELECT device_id FROM publish_locks WHERE token = ?1').get(lockToken) as any).device_id}/${gen}/demo/index.html`;
+  f.contentBucket.put(objectKey, { body: html, contentType: 'text/html' });
+  const committed = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/commit`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        lockToken,
+        pages: [{ slug: 'demo', title: 'demo', source: 's', repository: 'r', stream: 'main', streamLabel: 'main', date: '2026-08-16', updatedAt: '2026-08-16T00:00:00.000Z', bytes: Buffer.byteLength(html), md5: createHash('md5').update(html).digest('hex') }],
+      }),
+    }), f.env, f.context);
+  assert.equal(committed.status, 200);
+
+  // commit済みlockTokenでのrenewはゾンビ扱いで409（旧lockはcommitで解放済み）
+  const renewAfterCommit = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/renew`, {
+      method: 'POST', headers, body: JSON.stringify({ lockToken }),
+    }), f.env, f.context);
+  assert.equal(renewAfterCommit.status, 409);
+
+  // 解放後は新規lockを取得できる（排他が永続しない）
+  const afterRelease = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers }), f.env, f.context);
+  assert.equal(afterRelease.status, 200);
+});
+
+test('commit verification rejects missing/size/md5-mismatched uploads without touching D1', async () => {
+  const f = fixture();
+  const token = await claimDevice(f, await createPairingCode(f));
+  const headers = { 'x-review-device-token': token };
+
+  // 検証失敗はlockを消費しない（§4.3 step2/3）ため、以降すべて同じlockTokenを使い回せる
+  const lockRes = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers }), f.env, f.context);
+  const { token: lockToken, gen } = await lockRes.json() as any;
+  const deviceId = (f.db.database.prepare('SELECT device_id FROM publish_locks WHERE token = ?1').get(lockToken) as any).device_id;
+
+  async function commit(pages: any[]): Promise<Response> {
+    return consoleWorker.fetch(
+      new Request(`${CONSOLE}/api/device/publish/commit`, {
+        method: 'POST', headers, body: JSON.stringify({ lockToken, pages }),
+      }), f.env, f.context);
+  }
+  const page = (overrides: Record<string, unknown>) => ({
+    slug: 'demo', title: 'demo', source: 'https://example.com/repo', repository: 'repo',
+    stream: 'main', streamLabel: 'main', date: '2026-08-16', updatedAt: '2026-08-16T00:00:00.000Z',
+    bytes: 5, md5: createHash('md5').update('<h1>').digest('hex'), ...overrides,
+  });
+  const pagesCount = () => (f.db.database.prepare('SELECT COUNT(*) AS c FROM pages').get() as any).c;
+
+  // オブジェクト自体が存在しない（アップロード未完了・別バケット誤り等）
+  assert.equal((await commit([page({})])).status, 400);
+  assert.equal(pagesCount(), 0);
+
+  // サイズ不一致（切断アップロード）
+  const html = '<h1>Demo</h1>';
+  f.contentBucket.put(`pages/${deviceId}/${gen}/demo/index.html`, { body: html, contentType: 'text/html' });
+  assert.equal(
+    (await commit([page({ bytes: 999, md5: createHash('md5').update(html).digest('hex') })])).status, 400);
+  assert.equal(pagesCount(), 0);
+
+  // md5(etag)不一致（内容の取り違え）
+  assert.equal(
+    (await commit([page({ bytes: Buffer.byteLength(html), md5: 'a'.repeat(32) })])).status, 400);
+  assert.equal(pagesCount(), 0);
+
+  // マルチパートアップロードを模したetag（32桁hex以外）は400
+  f.contentBucket.put(`pages/${deviceId}/${gen}/multipart/index.html`, { body: html, contentType: 'text/html', etag: 'deadbeef-2' });
+  assert.equal(
+    (await commit([page({ slug: 'multipart', bytes: Buffer.byteLength(html), md5: createHash('md5').update(html).digest('hex') })])).status,
+    400,
+  );
+  assert.equal(pagesCount(), 0);
+
+  // 正しい内容なら成功する（lockはまだ有効なまま——検証失敗はlockを消費しない）
+  const ok = await commit([page({ bytes: Buffer.byteLength(html), md5: createHash('md5').update(html).digest('hex') })]);
+  assert.equal(ok.status, 200);
+  assert.equal(pagesCount(), 1);
+});
+
+test('generation GC preserves current and young generations, deletes only aged non-current ones', async () => {
+  const f = fixture();
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId, gen: gen1 } = await publishPage(f, token, 'demo', '<h1>v1</h1>');
+
+  // 「非常に古い」世代を直接R2へ注入する（epoch=1、maximumShareDays=30日を大幅に超える）
+  const staleGen = '1-aaaaaaaaaaaaaaaa';
+  const staleKey = `pages/${deviceId}/${staleGen}/orphan/index.html`;
+  f.contentBucket.put(staleKey, { body: '<h1>stale</h1>', contentType: 'text/html' });
+
+  // 2回目のpublishでgcStaleGenerationsが走る
+  await publishPage(f, token, 'demo', '<h1>v2</h1>');
+
+  const staleStillThere = await f.contentBucket.get(staleKey);
+  assert.equal(staleStillThere, null); // 古い孤児世代は削除される
+
+  const gen1Object = await f.contentBucket.get(`pages/${deviceId}/${gen1}/demo/index.html`);
+  assert.notEqual(gen1Object, null); // 直近の非現行世代(gen1)は年齢条件でまだ守られる
+});
+
+test('purge: lock conflict, purging blocks new publish locks, idempotent re-run, and pages disappear', async () => {
+  const f = fixture();
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId } = await publishPage(f, token, 'demo', '<h1>Demo</h1>');
+
+  assert.equal(
+    (await consoleWorker.fetch(new Request(`${CONSOLE}/api/owner/devices/unknown-id/purge`, {
+      method: 'POST', headers: ownerHeaders(),
+    }), f.env, f.context)).status,
+    404,
+  );
+
+  // lock保持中のpurgeは409
+  const held = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers: { 'x-review-device-token': token } }),
+    f.env, f.context);
+  assert.equal(held.status, 200);
+  const conflicted = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/devices/${deviceId}/purge`, { method: 'POST', headers: ownerHeaders() }),
+    f.env, f.context);
+  assert.equal(conflicted.status, 409);
+
+  // lockを解放（renewせず放置は現実的でないため、テストでは直接commitして解放する）
+  const { token: heldLockToken, gen: heldGen } = await held.json() as any;
+  const html = '<h1>Demo2</h1>';
+  f.contentBucket.put(`pages/${deviceId}/${heldGen}/demo/index.html`, { body: html, contentType: 'text/html' });
+  await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/commit`, {
+      method: 'POST', headers: { 'x-review-device-token': token },
+      body: JSON.stringify({
+        lockToken: heldLockToken,
+        pages: [{ slug: 'demo', title: 'demo', source: 's', repository: 'r', stream: 'main', streamLabel: 'main', date: '2026-08-16', updatedAt: '2026-08-16T00:00:00.000Z', bytes: Buffer.byteLength(html), md5: createHash('md5').update(html).digest('hex') }],
+      }),
+    }), f.env, f.context);
+
+  const purged = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/devices/${deviceId}/purge`, { method: 'POST', headers: ownerHeaders() }),
+    f.env, f.context);
+  assert.equal(purged.status, 200);
+  assert.deepEqual(await purged.json(), { done: true });
+
+  // 完了済みpurgeはrevoked_atも設定するため、以降このデバイストークンでの
+  // アクセスは device() 自体が拒否する401になる（purging中限定の403は別テストで検証）
+  const blockedLock = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers: { 'x-review-device-token': token } }),
+    f.env, f.context);
+  assert.equal(blockedLock.status, 401);
+
+  // 一覧・配信から消える
+  const pagesRow = f.db.database.prepare('SELECT COUNT(*) AS c FROM pages WHERE device_id = ?1').get(deviceId) as any;
+  assert.equal(pagesRow.c, 0);
+  const devicesRow = f.db.database.prepare('SELECT revoked_at, purging_at FROM devices WHERE id = ?1').get(deviceId) as any;
+  assert.notEqual(devicesRow.revoked_at, null);
+  assert.notEqual(devicesRow.purging_at, null);
+  const listed = await f.contentBucket.list({ prefix: `pages/${deviceId}/` });
+  assert.equal(listed.objects.length, 0);
+
+  // 再実行しても冪等に成功する
+  const again = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/devices/${deviceId}/purge`, { method: 'POST', headers: ownerHeaders() }),
+    f.env, f.context);
+  assert.equal(again.status, 200);
+  assert.deepEqual(await again.json(), { done: true });
+});
+
+test('purge budget exhaustion returns done:false, blocks new publish locks (403) while purging, and resumes to completion', async () => {
+  // R2一覧は1回のlist()で最大1000件までしか返らない（Worker側でハードコード）ため、
+  // 1回のpurge呼び出しでは完了しきれない状況を作るには1000件超のオブジェクトが要る。
+  // R2_OPERATION_BUDGET=2（list1回+delete1回のみ許容）と組み合わせ、1回目の
+  // 呼び出しで1000件だけ消して打ち切られることを検証する。
+  const f = fixture({ R2_OPERATION_BUDGET: '2' });
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId } = await publishPage(f, token, 'demo', '<h1>Demo</h1>');
+  for (let index = 0; index < 1500; index += 1) {
+    f.contentBucket.put(`pages/${deviceId}/9999999999-orphan/filler-${index}/index.html`, { body: 'x' });
+  }
+
+  const first = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/devices/${deviceId}/purge`, { method: 'POST', headers: ownerHeaders() }),
+    f.env, f.context);
+  assert.equal(first.status, 202);
+  assert.equal((await first.json() as any).done, false);
+
+  // purging中(revoked_atはまだ未設定)は新規publish lockが403で拒否される
+  const devicesRowMid = f.db.database.prepare('SELECT revoked_at, purging_at FROM devices WHERE id = ?1').get(deviceId) as any;
+  assert.notEqual(devicesRowMid.purging_at, null);
+  assert.equal(devicesRowMid.revoked_at, null);
+  const blockedMidPurge = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers: { 'x-review-device-token': token } }),
+    f.env, f.context);
+  assert.equal(blockedMidPurge.status, 403);
+
+  // 再実行（curl手順の想定どおり）で残りを消し切り、完了する
+  let done = false;
+  for (let attempt = 0; attempt < 5 && !done; attempt += 1) {
+    const retry = await consoleWorker.fetch(
+      new Request(`${CONSOLE}/api/owner/devices/${deviceId}/purge`, { method: 'POST', headers: ownerHeaders() }),
+      f.env, f.context);
+    done = (await retry.json() as any).done === true;
+  }
+  assert.equal(done, true);
+  const listed = await f.contentBucket.list({ prefix: `pages/${deviceId}/` });
+  assert.equal(listed.objects.length, 0);
+  const devicesRowAfter = f.db.database.prepare('SELECT revoked_at FROM devices WHERE id = ?1').get(deviceId) as any;
+  assert.notEqual(devicesRowAfter.revoked_at, null);
+});
+
+test('purge lease renewal re-reads the clock on every batch instead of reusing a stale value (regression)', async () => {
+  // 実装レビューBLOCKER: 以前はpurgeDeviceObjects()へ呼び出し時点で固定したnowを渡し、
+  // 各バッチのUPDATE expires_atを毎回「同じ値」に書いていた。時間が経過しても
+  // 有効期限が実際には押し上がらず、「バッチ毎にlease延長する」（設計§7）を
+  // 満たしていなかった。nowFnを注入し、バッチ毎に「その時点の最新値」が
+  // 書き込まれることを直接検証する。
+  const f = fixture({ R2_OPERATION_BUDGET: '100' });
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId } = await publishPage(f, token, 'demo', '<h1>Demo</h1>');
+  // list()が2ページに分かれるよう1000件超のオブジェクトを注入する
+  // （1ページ内は常に1回のdeleteバッチにチャンクされるため、2回目のrenewalを
+  // 起こすには2ページ目が要る）。
+  for (let index = 0; index < 1500; index += 1) {
+    f.contentBucket.put(`pages/${deviceId}/9999999999-orphan/filler-${index}/index.html`, { body: 'x' });
+  }
+  const lockRow = f.db.database.prepare('SELECT token, expires_at FROM publish_locks WHERE device_id = ?1').get(deviceId) as any;
+  assert.equal(lockRow, undefined); // publishPage完了時点でlockは解放済み（ここでは新規取得する）
+  const lockRes = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers: { 'x-review-device-token': token } }),
+    f.env, f.context);
+  const { token: lockToken } = await lockRes.json() as any;
+
+  const clockValues = [1_700_000_000, 1_700_002_000]; // 2つ目は1つ目より2000秒進んでいる
+  let calls = 0;
+  const result = await purgeDeviceObjects(f.env, deviceId, lockToken, () => clockValues[calls++] ?? clockValues[clockValues.length - 1]);
+  assert.equal(calls, 2); // 2バッチ分、毎回nowFnを呼び直している
+  assert.equal(result.done, true);
+
+  // purge完了によりlock行は削除されるため、中間状態は直接は見えない。
+  // 「毎回呼び直している」こと自体（calls===2・2つの異なる値が実際に使われたこと）が
+  // 固定値の使い回しではないことの直接証拠であり、旧実装（呼び出し時固定のnowを
+  // 使い回す）ではnowFnという差し替え口自体が存在せず、1回目の値のまま
+  // 何度書き込んでも区別がつかなかった。
+});
+
+test('purge renews the lease before deleting each batch, and never deletes when renewal fails (regression: ordering)', async () => {
+  // 実装レビューBLOCKER: delete→renewの順だと、deleteに時間がかかってTTLが切れた場合、
+  // そのbatchはlock保護の外側で削除されてしまう。renew（成功確認込み）が先で、
+  // 失敗したらそのbatchのdeleteを一切呼ばないことを直接検証する。
+  const f = fixture({ R2_OPERATION_BUDGET: '100' });
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId } = await publishPage(f, token, 'demo', '<h1>Demo</h1>');
+  for (let index = 0; index < 1500; index += 1) {
+    f.contentBucket.put(`pages/${deviceId}/9999999999-orphan/filler-${index}/index.html`, { body: 'x' });
+  }
+  const lockRes = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers: { 'x-review-device-token': token } }),
+    f.env, f.context);
+  const { token: lockToken } = await lockRes.json() as any;
+
+  const originalDelete = f.contentBucket.delete.bind(f.contentBucket);
+  let deleteCalls = 0;
+  (f.contentBucket as any).delete = async (...args: unknown[]) => {
+    deleteCalls += 1;
+    return (originalDelete as any)(...args);
+  };
+
+  let renewCalls = 0;
+  const nowFn = () => {
+    renewCalls += 1;
+    assert.equal(deleteCalls, 0, 'renewはdeleteより前に呼ばれるはず（まだ一度もdeleteされていないはず）');
+    // ここでlockを奪う（横取り/失効を模す）ことで、直後のUPDATEを失敗させる
+    f.db.database.prepare('UPDATE publish_locks SET token = ?1 WHERE device_id = ?2').run('stolen-token', deviceId);
+    return 1_700_000_000;
+  };
+  const result = await purgeDeviceObjects(f.env, deviceId, lockToken, nowFn);
+  assert.equal(renewCalls, 1);
+  assert.equal(deleteCalls, 0); // renew失敗時はdeleteが一切呼ばれない
+  assert.equal(result.done, false);
+  assert.ok(result.remaining > 0);
+
+  const listed = await f.contentBucket.list({ prefix: `pages/${deviceId}/`, limit: 2000 });
+  assert.equal(listed.objects.length, 1501); // 何も削除されていない（1500 filler + demo自身の1件）
+});
+
+test('GC aborts if the lock or D1 current gen changes mid-run (defense in depth, §4.4)', async () => {
+  const f = fixture({ R2_OPERATION_BUDGET: '100' });
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId, gen: gen1 } = await publishPage(f, token, 'demo', '<h1>v1</h1>');
+  // 1000件超の「非常に古い」孤児オブジェクトを注入し、list()が複数ページに分かれ、
+  // gcStaleGenerationsのdeleteバッチが複数回起きるようにする
+  for (let index = 0; index < 1500; index += 1) {
+    f.contentBucket.put(`pages/${deviceId}/1-aaaaaaaaaaaaaaaa/orphan-${index}/index.html`, { body: 'x' });
+  }
+
+  // R2Stub.list()を横取りし、2回目の呼び出し（＝1バッチ目のdelete完了後）で
+  // publish_locksのgenを書き換える（別publishが割り込んだ状況を模す）。
+  const originalList = f.contentBucket.list.bind(f.contentBucket);
+  let listCalls = 0;
+  (f.contentBucket as any).list = async (...args: any[]) => {
+    listCalls += 1;
+    if (listCalls === 2) {
+      f.db.database.prepare('UPDATE publish_locks SET gen = ?1 WHERE device_id = ?2').run('9999999999-changed', deviceId);
+    }
+    return (originalList as any)(...args);
+  };
+
+  const { gen: gen2 } = await publishPage(f, token, 'demo', '<h1>v2</h1>'); // 内部でcommit→GC起動
+  assert.notEqual(gen2, gen1);
+
+  // gen1(現行より前の若い世代)は年齢条件でそもそも保護対象だが、1500件の孤児は
+  // 全て削除対象年齢のはず。gen変化を検知して1バッチ目で打ち切っているため、
+  // 全件は消えていない（2バッチ目以降が残る）。
+  const remainingOrphans = (await f.contentBucket.list({ prefix: `pages/${deviceId}/1-aaaaaaaaaaaaaaaa/`, limit: 1000 })).objects;
+  assert.ok(remainingOrphans.length > 0, 'GCがgen変化を検知せず全件消してしまっている');
+});
+
+test('GET /api/owner/pages returns the manifest-shaped contract with deviceId/deviceName', async () => {
+  const f = fixture();
+  const tokenA = await claimDevice(f, await createPairingCode(f), 'Device A');
+  const tokenB = await claimDevice(f, await createPairingCode(f), 'Device B');
+  await publishPage(f, tokenA, 'older', '<h1>older</h1>', { date: '2026-08-01' });
+  await publishPage(f, tokenB, 'newer', '<h1>newer</h1>', { date: '2026-08-15' });
+
+  const response = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/pages`, { headers: ownerHeaders() }), f.env, f.context);
+  assert.equal(response.status, 200);
+  const body = await response.json() as any;
+  assert.match(body.generatedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(body.pages.length, 2);
+  assert.equal(body.pages[0].slug, 'newer'); // date降順
+  assert.equal(body.pages[1].slug, 'older');
+  assert.deepEqual(Object.keys(body.pages[0]).sort(), [
+    'date', 'deviceId', 'deviceName', 'href', 'objectKey',
+    'repository', 'slug', 'source', 'stream', 'streamLabel', 'title', 'updatedAt',
+  ].sort());
+  assert.equal(body.pages[0].deviceName, 'Device B');
+  const parsedHref = new URL(body.pages[0].href);
+  assert.equal(parsedHref.pathname, `/${body.pages[0].objectKey}`);
+  assert.match(parsedHref.searchParams.get('e') ?? '', /^\d+$/);
+});
+
+test('GET /api/owner/devices reports purging/revoked state', async () => {
+  const f = fixture();
+  const token = await claimDevice(f, await createPairingCode(f), 'Purge Me');
+  const { deviceId } = await publishPage(f, token, 'demo', '<h1>Demo</h1>');
+
+  const before = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/devices`, { headers: ownerHeaders() }), f.env, f.context);
+  const beforeItem = (await before.json() as any).items.find((item: any) => item.id === deviceId);
+  assert.equal(beforeItem.name, 'Purge Me');
+  assert.equal('purgingAt' in beforeItem, false);
+  assert.equal('revokedAt' in beforeItem, false);
+
+  await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/devices/${deviceId}/purge`, { method: 'POST', headers: ownerHeaders() }),
+    f.env, f.context);
+
+  const after = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/devices`, { headers: ownerHeaders() }), f.env, f.context);
+  const afterItem = (await after.json() as any).items.find((item: any) => item.id === deviceId);
+  assert.equal(typeof afterItem.purgingAt, 'string');
+  assert.equal(typeof afterItem.revokedAt, 'string');
 });
