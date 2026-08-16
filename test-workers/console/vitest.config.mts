@@ -31,7 +31,7 @@ export default defineConfig(async () => {
           compatibilityDate: '2026-08-01',
           compatibilityFlags: ['nodejs_compat'],
           d1Databases: ['DB'],
-          r2Buckets: ['CONSOLE'],
+          r2Buckets: ['CONSOLE', 'CONTENT'],
           // Worker からの外部fetchをNode側でモックする（Access certsエンドポイントのみ許可）
           outboundService(request: Request) {
             const url = new URL(request.url);
@@ -51,6 +51,7 @@ export default defineConfig(async () => {
             CONSOLE_ORIGIN: 'https://console.example.com',
             CONTENT_ORIGIN: 'https://content.example.com',
             MAXIMUM_SHARE_DAYS: '30',
+            OWNER_LINK_DAYS: '30',
             ALLOWED_INTERNAL_CIDRS: '["203.0.113.0/24"]',
             ACCESS_TEAM_DOMAIN: 'team.cloudflareaccess.com',
             ACCESS_AUD: 'aud-tag-1234',
