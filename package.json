@@ -1,5 +1,5 @@
 {
-  "name": "@joelmitz/html-share",
+  "name": "@joelmitz/html-share-cloudflare",
   "version": "0.1.0",
   "description": "Self-hosted HTML dashboard for Claude Code results (Cloudflare fork)",
   "type": "module",
@@ -8,10 +8,10 @@
   "author": "Minoru Onda",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/joelmitz/html-share.git"
+    "url": "git+https://github.com/joelmitz/html-share-cloudflare.git"
   },
-  "homepage": "https://github.com/joelmitz/html-share#readme",
-  "bugs": "https://github.com/joelmitz/html-share/issues",
+  "homepage": "https://github.com/joelmitz/html-share-cloudflare#readme",
+  "bugs": "https://github.com/joelmitz/html-share-cloudflare/issues",
   "keywords": [
     "claude-code",
     "codex",

@@ -15,8 +15,8 @@ HTML共有くん（Cloudflare版）は、自分のCloudflareアカウントへ�
 ## インストール
 
 ```bash
-git clone https://github.com/joelmitz/html-share.git
-cd html-share
+git clone https://github.com/joelmitz/html-share-cloudflare.git
+cd html-share-cloudflare
 npm install
 npm run build
 npm link

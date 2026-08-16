@@ -6,7 +6,7 @@
 
 GitHubのSecurity Advisoriesから非公開で報告してください。
 
-https://github.com/joelmitz/html-share/security/advisories/new
+https://github.com/joelmitz/html-share-cloudflare/security/advisories/new
 
 受領から7日以内に一次回答を行い、影響範囲と修正方針を連絡します。修正が公開されるまで、脆弱性の詳細な公開は控えてください。
 
