@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { cleanReadMark, cleanReadMarks } from '../functions/review-handler.ts';
+import { cleanReadMark, cleanReadMarks } from '../workers/console/src/read-marks.ts';
 
 test('accepts legacy ISO read marks and object marks with v:null', () => {
   assert.deepEqual(cleanReadMark('2026-08-14T00:00:00.000Z'), {

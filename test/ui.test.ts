@@ -37,12 +37,15 @@ test('ships the full dashboard UI and inbox wording', () => {
 
 test('folds overflowing tables on the viewing origin without network access', () => {
   const tables = readFileSync(path.join(root, 'web', 'mobile-tables.js'), 'utf8');
-  const handler = readFileSync(path.join(root, 'functions', 'review-handler.ts'), 'utf8');
+  const handler = readFileSync(path.join(root, 'workers', 'console', 'src', 'index.ts'), 'utf8');
   assert.match(tables, /data-mb-tables="off"/);
   assert.doesNotMatch(tables, /\bfetch\s*\(/);
   assert.doesNotMatch(tables, /XMLHttpRequest/);
-  assert.match(handler, /target: clean\(body\.target, 'target', 60\)/);
-  assert.doesNotMatch(handler, /target: clean\(body\.target[\s\S]{0,80}device/);
+  // target を受け付けるのはオーナー（インボックス）投稿だけで、端末投稿は受け付けない
+  assert.match(handler, /clean\(body\.target, 'target', 60\)/);
+  const inserts = handler.split('INSERT INTO tasks');
+  assert.equal(inserts.length, 3);
+  assert.equal(inserts.slice(1).filter((part) => part.slice(0, 400).includes('target')).length, 1);
 });
 
 test('does not ship the discarded simplified dashboard files', () => {

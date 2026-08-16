@@ -31,7 +31,7 @@ function credentialsPath(): string {
 }
 
 function apiBase(config: HtmlShareConfig): string {
-  return `https://${config.aws.consoleDomain}/api`;
+  return `https://${config.cloudflare.consoleDomain}/api`;
 }
 
 function loadCredentials(): DeviceCredentials | null {

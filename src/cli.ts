@@ -87,7 +87,7 @@ async function main(): Promise<void> {
     }
     if (action === 'store') {
       await storePrivateKey(config, flag('--overwrite'));
-      console.log(JSON.stringify({ ok: true, parameterName: config.aws.privateKeyParameterName }));
+      console.log(JSON.stringify({ ok: true, secrets: ['console:SIGNING_PRIVATE_KEY', 'content:SIGNING_PUBLIC_KEY'] }));
       return;
     }
     usage();

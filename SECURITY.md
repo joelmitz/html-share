@@ -6,7 +6,7 @@
 
 GitHubのSecurity Advisoriesから非公開で報告してください。
 
-https://github.com/minorun365/html-share/security/advisories/new
+https://github.com/joelmitz/html-share/security/advisories/new
 
 受領から7日以内に一次回答を行い、影響範囲と修正方針を連絡します。修正が公開されるまで、脆弱性の詳細な公開は控えてください。
 
@@ -16,8 +16,6 @@ https://github.com/minorun365/html-share/security/advisories/new
 
 ## Deployment responsibility
 
-HTML共有くんはセルフホスト型です。AWSアカウント、ドメイン、認証ユーザー、配信するコンテンツ、共有URLの管理は各利用者が行います。
+HTML共有くんはセルフホスト型です。Cloudflareアカウント、ドメイン、認証ユーザー、配信するコンテンツ、共有URLの管理は各利用者が行います。
 
-本番依存関係は `npm run audit:prod` で検査します。CDKはローカルでインフラを合成する開発依存として分離しています。
-
-2026年8月13日時点の最新 `aws-cdk-lib` には、ローカルのインフラ合成でのみ使われる `brace-expansion` の既知アドバイザリが残っています。HTML共有くんのLambdaやブラウザへは配布されません。Dependabotで修正版を追跡します。
+本番依存関係は `npm run audit:prod` で検査します。wranglerはローカルでデプロイに使う開発依存として分離しています。

@@ -28,4 +28,4 @@ body:
     id: environment
     attributes:
       label: 実行環境
-      placeholder: macOS / Node.js 22 / AWSリージョン
+      placeholder: macOS / Node.js 22 / Cloudflareアカウント種別

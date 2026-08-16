@@ -1,14 +1,13 @@
 ownerEmail: owner@example.com
 
-aws:
-  region: ap-northeast-1
+cloudflare:
+  accountId: "00000000000000000000000000000000"
   consoleDomain: html-share-console.example.com
   contentDomain: html-share-content.example.com
-  certificateArn: arn:aws:acm:us-east-1:111122223333:certificate/00000000-0000-4000-8000-000000000000
-  cognitoDomainPrefix: html-share-example
+  consoleBucket: html-share-console
+  contentBucket: html-share-content
   publicKeyPath: .html-share/keys/public.pem
   privateKeyPath: .html-share/keys/private.pem
-  privateKeyParameterName: /html-share/cloudfront/private-key
 
 content:
   roots:

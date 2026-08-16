@@ -4,13 +4,13 @@ import {
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { BuildManifest, BuiltPage } from './bundle.js';
 import { buildSite } from './bundle.js';
-import type { HtmlShareConfig, StackOutputs } from './config.js';
-import { loadOutputs, resolveFromConfig } from './config.js';
+import type { HtmlShareConfig } from './config.js';
+import { contentUrl, consoleUrl, resolveFromConfig } from './config.js';
 import { signUrl } from './sign.js';
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -61,6 +61,19 @@ function copyConsole(buildRoot: string, manifest: object): void {
   }, null, 2)}\n`);
 }
 
+function r2Client(config: HtmlShareConfig): S3Client {
+  const accessKeyId = process.env.R2_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error('Set R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY (an R2 API token with Object Read & Write).');
+  }
+  return new S3Client({
+    region: 'auto',
+    endpoint: `https://${config.cloudflare.accountId}.r2.cloudflarestorage.com`,
+    credentials: { accessKeyId, secretAccessKey },
+  });
+}
+
 async function emptyBucket(client: S3Client, bucket: string): Promise<void> {
   let continuationToken: string | undefined;
   do {
@@ -85,15 +98,14 @@ async function uploadTree(client: S3Client, bucket: string, root: string): Promi
   }
 }
 
-function ownerManifest(manifest: BuildManifest, outputs: StackOutputs, config: HtmlShareConfig): object {
-  const privateKeyPath = resolveFromConfig(config, config.aws.privateKeyPath);
+function ownerManifest(manifest: BuildManifest, config: HtmlShareConfig): object {
+  const privateKeyPath = resolveFromConfig(config, config.cloudflare.privateKeyPath);
   return {
     generatedAt: manifest.generatedAt,
     pages: manifest.pages.map((page: BuiltPage) => ({
       ...page,
       href: signUrl({
-        url: `${outputs.ContentUrl}/${page.objectKey}`,
-        keyPairId: outputs.CloudFrontPublicKeyId,
+        url: `${contentUrl(config)}/${page.objectKey}`,
         privateKeyPath,
         days: config.content.ownerLinkDays,
       }),
@@ -109,14 +121,12 @@ export function buildOnly(config: HtmlShareConfig): { buildRoot: string; manifes
 }
 
 export async function publish(config: HtmlShareConfig): Promise<{ consoleUrl: string; pages: number }> {
-  const outputsFile = path.resolve(config.baseDir, '.html-share', 'outputs.json');
-  const outputs = loadOutputs(outputsFile);
   const { buildRoot, manifest } = buildOnly(config);
-  copyConsole(buildRoot, ownerManifest(manifest, outputs, config));
-  const client = new S3Client({ region: config.aws.region });
-  await uploadTree(client, outputs.ContentBucketName, path.join(buildRoot, 'content'));
-  await uploadTree(client, outputs.ConsoleBucketName, path.join(buildRoot, 'console'));
-  return { consoleUrl: `${outputs.ConsoleUrl}/app/index.html`, pages: manifest.pages.length };
+  copyConsole(buildRoot, ownerManifest(manifest, config));
+  const client = r2Client(config);
+  await uploadTree(client, config.cloudflare.contentBucket, path.join(buildRoot, 'content'));
+  await uploadTree(client, config.cloudflare.consoleBucket, path.join(buildRoot, 'console'));
+  return { consoleUrl: `${consoleUrl(config)}/app/index.html`, pages: manifest.pages.length };
 }
 
 export function share(config: HtmlShareConfig, query: string, days: number): string {
@@ -125,13 +135,11 @@ export function share(config: HtmlShareConfig, query: string, days: number): str
   }
   const buildRoot = path.resolve(config.baseDir, '.html-share', 'build');
   const manifest = JSON.parse(readFileSync(path.join(buildRoot, 'manifest.json'), 'utf8')) as BuildManifest;
-  const outputs = loadOutputs(path.resolve(config.baseDir, '.html-share', 'outputs.json'));
   const matches = manifest.pages.filter((page) => page.slug === query || page.slug.includes(query) || page.title.includes(query));
   if (matches.length !== 1) throw new Error(matches.length ? `Multiple pages match ${query}: ${matches.map((p) => p.slug).join(', ')}` : `Page not found: ${query}`);
   return signUrl({
-    url: `${outputs.ContentUrl}/${matches[0].objectKey}`,
-    keyPairId: outputs.CloudFrontPublicKeyId,
-    privateKeyPath: resolveFromConfig(config, config.aws.privateKeyPath),
+    url: `${contentUrl(config)}/${matches[0].objectKey}`,
+    privateKeyPath: resolveFromConfig(config, config.cloudflare.privateKeyPath),
     days,
   });
 }
