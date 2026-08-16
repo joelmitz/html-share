@@ -4,14 +4,19 @@ import { cleanReadMarks } from './read-marks.js';
 export interface Env {
   DB: D1Database;
   CONSOLE: R2Bucket;
+  CONTENT: R2Bucket;
   SIGNING_PRIVATE_KEY: string;
   OWNER_EMAIL: string;
   CONSOLE_ORIGIN: string;
   CONTENT_ORIGIN: string;
   MAXIMUM_SHARE_DAYS: string;
+  OWNER_LINK_DAYS: string;
   ALLOWED_INTERNAL_CIDRS: string;
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_AUD: string;
+  // 省略時はDEFAULT_R2_OPERATION_BUDGET。テストが上限到達（繰り越し）の
+  // 挙動を少量のオブジェクトで再現できるようにするための上書き口
+  R2_OPERATION_BUDGET?: string;
 }
 
 const TASK_TTL_SECONDS = 90 * 24 * 60 * 60;
@@ -19,9 +24,23 @@ const PAIR_TTL_SECONDS = 10 * 60;
 // 期待するJSONは最大でも数百KB（readMarks 800件）。isolateのメモリ(128MB)保護のため
 // Content-Lengthに依存せずstreamを上限まで読み、超過は413で拒否する。
 const MAX_BODY_BYTES = 1024 * 1024;
+// 個々のページオブジェクトのサイズ上限。CLI側のconfig.content.maximumAssetBytes
+// 既定値(10MB)に合わせる。commitのアップロード検証で使う。
+const MAX_PAGE_BYTES = 10 * 1024 * 1024;
 const OWNER_DEVICE_ID = 'OWNER';
 const INBOX_SESSION_ID = 'inbox';
+const PUBLISH_LOCK_TTL_SECONDS = 30 * 60;
+// 1回のcommit/purge呼び出しでR2に対して行うlist/delete操作の上限の既定値。
+// 設計書の「~50サブリクエスト」を安全側に切り下げた値。上限到達は正常終了とし、
+// 残りは次回の呼び出しへ繰り越す（fail-closed。孤児オブジェクトは無署名では
+// 配信されないため、繰り越し自体に実害は無い）。
+const DEFAULT_R2_OPERATION_BUDGET = 20;
 const encoder = new TextEncoder();
+
+function r2OperationBudget(env: Env): number {
+  const value = Number(env.R2_OPERATION_BUDGET);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_R2_OPERATION_BUDGET;
+}
 let privateKeyPromise: Promise<CryptoKey> | undefined;
 
 function securityHeaders(env: Env, extra: Record<string, string> = {}): Headers {
@@ -131,6 +150,30 @@ function randomToken(bytes: number): string {
   return btoa(String.fromCharCode(...raw)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+function randomHex(bytes: number): string {
+  const raw = crypto.getRandomValues(new Uint8Array(bytes));
+  return [...raw].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+// "<epoch秒>-<乱数8バイトhex>"。先頭の時刻部がGCの年齢判定に使われる
+// （§4.4）ため、genはWorkerだけが発行する（クライアント指定不可）。
+function newGeneration(now: number): string {
+  return `${now}-${randomHex(8)}`;
+}
+
+// 不正な形式（時刻部が数値でない等）は年齢無限大＝「非常に古い」として安全側に倒す
+// （GCが誤って現行世代を守り損ねるより、誤って古いものとして掃除対象に回る方が
+// まし、という判断ではなく——実際には現行世代のgenはWorker自身が発行した形式
+// しか存在しないため、ここに来るのは孤児化した過去データの異常系のみ）。
+function generationAgeSeconds(gen: string, now: number): number {
+  const epoch = Number(gen.split('-')[0]);
+  return Number.isFinite(epoch) ? Math.max(0, now - epoch) : Number.POSITIVE_INFINITY;
+}
+
+function pageObjectKey(deviceId: string, gen: string, slug: string): string {
+  return `pages/${deviceId}/${gen}/${slug}/index.html`;
+}
+
 function validOrigin(request: Request, env: Env): boolean {
   return String(request.headers.get('origin') ?? '') === env.CONSOLE_ORIGIN;
 }
@@ -151,7 +194,13 @@ interface TaskRow {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  device_name: string | null; // devicesとのLEFT JOINで得る。'OWNER'等の非ペアリング済みIDはnullのまま
 }
+
+// devicesとのLEFT JOIN込みのSELECT。in_progress表示（作業中バッジ+デバイス名）が
+// claim直後のレスポンス・一覧取得のいずれでも同じ形になるよう、tasksを読む
+// 全箇所で共通化する（webの契約: deviceName。旧claimedByは使わない）。
+const TASK_SELECT = 'SELECT t.*, d.name AS device_name FROM tasks t LEFT JOIN devices d ON d.id = t.device_id';
 
 function publicTask(row: TaskRow): Record<string, unknown> {
   return {
@@ -169,7 +218,211 @@ function publicTask(row: TaskRow): Record<string, unknown> {
     ...(row.approved === null ? {} : { approved: row.approved === 1 }),
     ...(row.response_text === null ? {} : { responseText: row.response_text }),
     ...(row.completed_at === null ? {} : { completedAt: row.completed_at }),
+    ...(row.device_name === null ? {} : { deviceName: row.device_name }),
   };
+}
+
+interface PageRow {
+  device_id: string;
+  slug: string;
+  title: string;
+  source: string;
+  repository: string;
+  stream: string;
+  stream_label: string;
+  object_key: string;
+  page_date: string;
+  updated_at: string;
+}
+
+interface CommitPageInput {
+  slug: string;
+  title: string;
+  source: string;
+  repository: string;
+  stream: string;
+  streamLabel: string;
+  date: string;
+  updatedAt: string;
+  bytes: number;
+  md5: string;
+}
+
+// PUT側の入力検証。object_key・hrefはリクエストに含めない（Workerが導出するため、
+// クライアントが他デバイスのprefixや任意URLを注入する余地が構造的に無い）。
+function cleanCommitPages(value: unknown): CommitPageInput[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 500) {
+    throw Object.assign(new Error('pages is invalid'), { statusCode: 400 });
+  }
+  const seenSlugs = new Set<string>();
+  return value.map((raw, index) => {
+    if (!raw || typeof raw !== 'object') {
+      throw Object.assign(new Error(`pages[${index}] is invalid`), { statusCode: 400 });
+    }
+    const page = raw as Record<string, unknown>;
+    const slug = clean(page.slug, `pages[${index}].slug`, 128, true);
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
+      throw Object.assign(new Error(`pages[${index}].slug is invalid`), { statusCode: 400 });
+    }
+    if (seenSlugs.has(slug)) {
+      throw Object.assign(new Error(`pages[${index}].slug is duplicated`), { statusCode: 400 });
+    }
+    seenSlugs.add(slug);
+    const bytes = Number(page.bytes);
+    if (!Number.isInteger(bytes) || bytes < 0 || bytes > MAX_PAGE_BYTES) {
+      throw Object.assign(new Error(`pages[${index}].bytes is invalid`), { statusCode: 400 });
+    }
+    const md5 = String(page.md5 ?? '').toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(md5)) {
+      throw Object.assign(new Error(`pages[${index}].md5 is invalid`), { statusCode: 400 });
+    }
+    return {
+      slug,
+      title: clean(page.title, `pages[${index}].title`, 200, true),
+      source: clean(page.source, `pages[${index}].source`, 500, true),
+      repository: clean(page.repository, `pages[${index}].repository`, 100, true),
+      stream: clean(page.stream, `pages[${index}].stream`, 100, true),
+      streamLabel: clean(page.streamLabel, `pages[${index}].streamLabel`, 100, true),
+      date: clean(page.date, `pages[${index}].date`, 40, true),
+      updatedAt: clean(page.updatedAt, `pages[${index}].updatedAt`, 40, true),
+      bytes, md5,
+    };
+  });
+}
+
+// commit時のアップロード実在検証。R2の単一パートPutObjectのetagはコンテンツの
+// md5そのものであるため、追加サブリクエスト無しで内容一致まで検証できる。
+// 防ぐのは事故（切断アップロード・誤バケット・別ファイルの取り違え・並行プロセスの
+// 残骸）であり、R2書き込み資格情報の保持者による悪意（正しいmd5と共に偽内容を
+// 置く攻撃）は防がない——upstreamから変わらない信頼境界であり、本設計の非ゴール。
+async function verifyUploadedPages(env: Env, deviceId: string, gen: string, pages: CommitPageInput[]): Promise<void> {
+  const prefix = `pages/${deviceId}/${gen}/`;
+  const actual = new Map<string, { size: number; etag: string }>();
+  let cursor: string | undefined;
+  do {
+    const listed = await env.CONTENT.list({ prefix, cursor, limit: 1000 });
+    for (const object of listed.objects) actual.set(object.key, { size: object.size, etag: object.etag });
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+
+  for (const page of pages) {
+    const key = pageObjectKey(deviceId, gen, page.slug);
+    const found = actual.get(key);
+    if (!found) throw Object.assign(new Error(`Uploaded object is missing: ${page.slug}`), { statusCode: 400 });
+    if (found.size !== page.bytes) {
+      throw Object.assign(new Error(`Uploaded object size mismatch: ${page.slug}`), { statusCode: 400 });
+    }
+    const etag = found.etag.toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(etag)) {
+      // マルチパートアップロードのetagは "<hash>-<partCount>" 形式でmd5ではない。
+      // CLIは常に単一パートで送るため、ここに来るのは誤った経路での書き込みのみ。
+      throw Object.assign(new Error(`Uploaded object is not a single-part upload: ${page.slug}`), { statusCode: 400 });
+    }
+    if (etag !== page.md5) {
+      throw Object.assign(new Error(`Uploaded object content mismatch: ${page.slug}`), { statusCode: 400 });
+    }
+  }
+}
+
+// 年齢ベースの世代GC（§4.4）。現行世代でない、かつmaximumShareDaysより古い
+// オブジェクトだけを削除する。進行中・直近の世代は年齢条件だけで構造的に対象外
+// になるため、ゾンビプロセスの再開やlock TTLの超過とは独立に安全。
+async function gcStaleGenerations(env: Env, deviceId: string, currentGen: string, now: number): Promise<number> {
+  const maxAgeSeconds = Number(env.MAXIMUM_SHARE_DAYS) * 24 * 60 * 60;
+  const budget = r2OperationBudget(env);
+  const prefix = `pages/${deviceId}/`;
+  let cursor: string | undefined;
+  let deleted = 0;
+  let operations = 0;
+  do {
+    if (operations >= budget) break;
+    const listed = await env.CONTENT.list({ prefix, cursor, limit: 1000 });
+    operations += 1;
+    const staleKeys: string[] = [];
+    for (const object of listed.objects) {
+      const rest = object.key.slice(prefix.length); // "<gen>/<slug>/index.html"
+      const gen = rest.split('/')[0];
+      if (!gen || gen === currentGen) continue;
+      if (generationAgeSeconds(gen, now) > maxAgeSeconds) staleKeys.push(object.key);
+    }
+    for (let index = 0; index < staleKeys.length && operations < budget; index += 1000) {
+      const batch = staleKeys.slice(index, index + 1000);
+      await env.CONTENT.delete(batch);
+      operations += 1;
+      deleted += batch.length;
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor && operations < budget);
+  return deleted;
+}
+
+// publish lockの原始的な取得（行なし or 失効時のみ）。purge（§7 step1）はデバイスの
+// purging状態に関わらずこれで取得する（purge自身がpurging_atを立てる主体のため、
+// ここでpurging_atを見てしまうと自分自身の再実行を阻害する）。
+async function acquirePublishLock(env: Env, deviceId: string, now: number): Promise<{ token: string; gen: string } | null> {
+  const token = randomToken(32);
+  const gen = newGeneration(now);
+  const expiresAt = now + PUBLISH_LOCK_TTL_SECONDS;
+  const result = await env.DB.prepare(
+    `INSERT INTO publish_locks (device_id, token, gen, expires_at) VALUES (?1, ?2, ?3, ?4)
+     ON CONFLICT (device_id) DO UPDATE SET token = ?2, gen = ?3, expires_at = ?4
+     WHERE publish_locks.expires_at <= ?5`,
+  ).bind(deviceId, token, gen, expiresAt, now).run();
+  if (!result.meta.changes) return null;
+  return { token, gen };
+}
+
+// device向けpublish lock取得（§7 step2）。purging_atが立っているデバイスは取得不可。
+// 事前の存在チェックと同じ条件をINSERT自体のWHERE句にも埋め込むことで、
+// 「チェック→取得」の間にpurgeが割り込むTOCTOUを構造的に閉じる
+// （呼び出し側は失敗後にdevicesを読み直して403/409を判定する）。
+async function acquireDevicePublishLock(env: Env, deviceId: string, now: number): Promise<{ token: string; gen: string } | null> {
+  const token = randomToken(32);
+  const gen = newGeneration(now);
+  const expiresAt = now + PUBLISH_LOCK_TTL_SECONDS;
+  const notPurging = 'NOT EXISTS (SELECT 1 FROM devices WHERE id = ?1 AND purging_at IS NOT NULL)';
+  const result = await env.DB.prepare(
+    `INSERT INTO publish_locks (device_id, token, gen, expires_at)
+     SELECT ?1, ?2, ?3, ?4 WHERE ${notPurging}
+     ON CONFLICT (device_id) DO UPDATE SET token = ?2, gen = ?3, expires_at = ?4
+     WHERE publish_locks.expires_at <= ?5 AND ${notPurging}`,
+  ).bind(deviceId, token, gen, expiresAt, now).run();
+  if (!result.meta.changes) return null;
+  return { token, gen };
+}
+
+// purge（§7）: device配下の全世代を無条件削除する。gcStaleGenerationsと違い年齢・現行世代の
+// 判定はない（対象デバイスは既にpurging状態＝以後publishされないため、残っている
+// オブジェクトは全て不要）。作業量上限は共通のR2_OPERATION_BUDGETを使い、超過時は
+// done:falseとして呼び出し元（curl手順）が次回へ繰り越す。
+async function purgeDeviceObjects(env: Env, deviceId: string, lockToken: string, now: number): Promise<{ done: boolean; remaining: number }> {
+  const budget = r2OperationBudget(env);
+  const prefix = `pages/${deviceId}/`;
+  let cursor: string | undefined;
+  let operations = 0;
+  let remaining = 0;
+  let truncatedByBudget = false;
+  do {
+    if (operations >= budget) { truncatedByBudget = true; break; }
+    const listed = await env.CONTENT.list({ prefix, cursor, limit: 1000 });
+    operations += 1;
+    const keys = listed.objects.map((object) => object.key);
+    for (let index = 0; index < keys.length; index += 1000) {
+      if (operations >= budget) {
+        truncatedByBudget = true;
+        remaining += keys.length - index;
+        break;
+      }
+      await env.CONTENT.delete(keys.slice(index, index + 1000));
+      operations += 1;
+      // 削除に時間がかかってもlockが失効しないよう、バッチ毎にlease延長する
+      await env.DB.prepare('UPDATE publish_locks SET expires_at = ?1 WHERE device_id = ?2 AND token = ?3')
+        .bind(now + PUBLISH_LOCK_TTL_SECONDS, deviceId, lockToken).run();
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+    if (truncatedByBudget) break;
+  } while (cursor);
+  return { done: !truncatedByBudget && !cursor, remaining };
 }
 
 async function device(request: Request, env: Env): Promise<{ id: string; name: string } | null> {
@@ -182,7 +435,7 @@ async function device(request: Request, env: Env): Promise<{ id: string; name: s
 }
 
 async function tasks(env: Env, now: number): Promise<TaskRow[]> {
-  const result = await env.DB.prepare('SELECT * FROM tasks WHERE expires_at > ?1').bind(now).all<TaskRow>();
+  const result = await env.DB.prepare(`${TASK_SELECT} WHERE t.expires_at > ?1`).bind(now).all<TaskRow>();
   return result.results ?? [];
 }
 
@@ -228,6 +481,31 @@ async function signShareUrl(env: Env, url: string, expiresAt: number, cidrs: str
     s: bytesToBase64Url(new Uint8Array(signature)),
   }).toString();
   return target.toString();
+}
+
+// owner/deviceの両sharesエンドポイントで共有するロジック。D1のpages行から
+// object_keyを引いて署名する——クライアントが指定したパス文字列を署名する経路は
+// 存在しない（v3以降の設計転換。旧実装はslugからobjectKeyを直接組み立てていた）。
+async function handleShare(env: Env, deviceId: string, body: Record<string, any>, now: number): Promise<Response> {
+  const slug = clean(body.slug, 'slug', 128, true);
+  const scope = body.scope === 'internal' ? 'internal' : body.scope === 'public' ? 'public' : '';
+  if (!scope) return json(env, 400, { error: 'Invalid share scope' });
+  const days = Number(body.days);
+  const maximumDays = Number(env.MAXIMUM_SHARE_DAYS);
+  if (!Number.isInteger(days) || days < 1 || days > maximumDays) {
+    return json(env, 400, { error: `Share duration must be between 1 and ${maximumDays} days` });
+  }
+  const row = await env.DB.prepare('SELECT object_key FROM pages WHERE device_id = ?1 AND slug = ?2')
+    .bind(deviceId, slug).first<{ object_key: string }>();
+  if (!row) return json(env, 404, { error: 'Page not found' });
+  const expiresAt = now + days * 24 * 60 * 60;
+  const url = `${env.CONTENT_ORIGIN}/${row.object_key}`;
+  let cidrs: string[] = [];
+  if (scope === 'internal') {
+    cidrs = internalCidrs(env);
+    if (cidrs.length === 0) return json(env, 400, { error: 'Internal sharing is not configured' });
+  }
+  return json(env, 201, { url: await signShareUrl(env, url, expiresAt, cidrs), expiresAt });
 }
 
 async function requireOwner(request: Request, env: Env): Promise<boolean> {
@@ -349,7 +627,7 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
         clean(body.title, 'title', 120) || titleFromBody(question),
         question, clean(body.target, 'target', 60), iso, now + TASK_TTL_SECONDS,
       ).run();
-      const row = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?1').bind(id).first<TaskRow>();
+      const row = await env.DB.prepare(`${TASK_SELECT} WHERE t.id = ?1`).bind(id).first<TaskRow>();
       return json(env, 201, { item: publicTask(row!) });
     }
     if (verb === 'GET' && path === '/api/owner/preferences') {
@@ -382,23 +660,69 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
     }
     if (verb === 'POST' && path === '/api/owner/shares') {
       const body = await parseBody(request);
-      const slug = clean(body.slug, 'slug', 128, true);
-      if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) return json(env, 400, { error: 'Invalid slug' });
-      const scope = body.scope === 'internal' ? 'internal' : body.scope === 'public' ? 'public' : '';
-      if (!scope) return json(env, 400, { error: 'Invalid share scope' });
-      const days = Number(body.days);
-      const maximumDays = Number(env.MAXIMUM_SHARE_DAYS);
-      if (!Number.isInteger(days) || days < 1 || days > maximumDays) {
-        return json(env, 400, { error: `Share duration must be between 1 and ${maximumDays} days` });
+      const deviceId = clean(body.deviceId, 'deviceId', 128, true);
+      return handleShare(env, deviceId, body, now);
+    }
+    if (verb === 'GET' && path === '/api/owner/pages') {
+      const result = await env.DB.prepare(
+        `SELECT p.*, d.name AS device_name FROM pages p
+         JOIN devices d ON d.id = p.device_id
+         ORDER BY p.page_date DESC`,
+      ).all<PageRow & { device_name: string }>();
+      const ownerLinkExpiresAt = now + Number(env.OWNER_LINK_DAYS) * 24 * 60 * 60;
+      const pages = await Promise.all((result.results ?? []).map(async (row) => ({
+        slug: row.slug,
+        title: row.title,
+        source: row.source,
+        repository: row.repository,
+        stream: row.stream,
+        streamLabel: row.stream_label,
+        date: row.page_date,
+        updatedAt: row.updated_at,
+        objectKey: row.object_key,
+        href: await signShareUrl(env, `${env.CONTENT_ORIGIN}/${row.object_key}`, ownerLinkExpiresAt, []),
+        deviceId: row.device_id,
+        deviceName: row.device_name,
+      })));
+      return json(env, 200, { generatedAt: new Date().toISOString(), pages });
+    }
+    if (verb === 'GET' && path === '/api/owner/devices') {
+      const result = await env.DB.prepare(
+        'SELECT id, name, created_at, purging_at, revoked_at FROM devices ORDER BY created_at DESC',
+      ).all<{ id: string; name: string; created_at: string; purging_at: string | null; revoked_at: string | null }>();
+      const items = (result.results ?? []).map((row) => ({
+        id: row.id,
+        name: row.name,
+        createdAt: row.created_at,
+        ...(row.purging_at === null ? {} : { purgingAt: row.purging_at }),
+        ...(row.revoked_at === null ? {} : { revokedAt: row.revoked_at }),
+      }));
+      return json(env, 200, { items });
+    }
+    const purge = path.match(/^\/api\/owner\/devices\/([^/]+)\/purge$/);
+    if (verb === 'POST' && purge) {
+      const deviceId = purge[1];
+      const deviceRow = await env.DB.prepare('SELECT purging_at FROM devices WHERE id = ?1')
+        .bind(deviceId).first<{ purging_at: string | null }>();
+      if (!deviceRow) return json(env, 404, { error: 'Device not found' });
+      const lock = await acquirePublishLock(env, deviceId, now);
+      if (!lock) return json(env, 409, { error: 'Publish lock is held' });
+      if (deviceRow.purging_at === null) {
+        await env.DB.batch([
+          env.DB.prepare('UPDATE devices SET purging_at = ?1 WHERE id = ?2').bind(new Date().toISOString(), deviceId),
+          env.DB.prepare('DELETE FROM pages WHERE device_id = ?1').bind(deviceId),
+        ]);
       }
-      const expiresAt = now + days * 24 * 60 * 60;
-      const url = `${env.CONTENT_ORIGIN}/pages/${slug}/index.html`;
-      let cidrs: string[] = [];
-      if (scope === 'internal') {
-        cidrs = internalCidrs(env);
-        if (cidrs.length === 0) return json(env, 400, { error: 'Internal sharing is not configured' });
+      const result = await purgeDeviceObjects(env, deviceId, lock.token, now);
+      if (!result.done) {
+        await env.DB.prepare('DELETE FROM publish_locks WHERE device_id = ?1 AND token = ?2').bind(deviceId, lock.token).run();
+        return json(env, 202, { done: false, ...(result.remaining ? { remaining: result.remaining } : {}) });
       }
-      return json(env, 201, { url: await signShareUrl(env, url, expiresAt, cidrs), expiresAt });
+      await env.DB.batch([
+        env.DB.prepare('UPDATE devices SET revoked_at = ?1 WHERE id = ?2').bind(new Date().toISOString(), deviceId),
+        env.DB.prepare('DELETE FROM publish_locks WHERE device_id = ?1 AND token = ?2').bind(deviceId, lock.token),
+      ]);
+      return json(env, 200, { done: true });
     }
     const remove = path.match(/^\/api\/owner\/reviews\/([^/]+)$/);
     if (verb === 'DELETE' && remove) {
@@ -417,7 +741,7 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
          WHERE id = ?4 AND status = 'waiting'`,
       ).bind(approved ? 1 : 0, responseText, new Date().toISOString(), answer[1]).run();
       if (!result.meta.changes) return json(env, 409, { error: 'This request is expired or already used' });
-      const row = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?1').bind(answer[1]).first<TaskRow>();
+      const row = await env.DB.prepare(`${TASK_SELECT} WHERE t.id = ?1`).bind(answer[1]).first<TaskRow>();
       return json(env, 200, { item: publicTask(row!) });
     }
     return json(env, 404, { error: 'Not found' });
@@ -442,7 +766,7 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
         clean(body.recommendation, 'recommendation', 1000),
         iso, now + TASK_TTL_SECONDS,
       ).run();
-      const row = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?1').bind(id).first<TaskRow>();
+      const row = await env.DB.prepare(`${TASK_SELECT} WHERE t.id = ?1`).bind(id).first<TaskRow>();
       return json(env, 201, { item: publicTask(row!) });
     }
     if (verb === 'GET' && path === '/api/device/reviews') {
@@ -456,14 +780,82 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
         .map(publicTask);
       return json(env, 200, { items });
     }
+    // claim: owner投稿のinbox項目（source='owner'・waiting）を、着手前に原子的に取得する。
+    // 2台が同じ依頼をGETで同時に見つけても、claimに成功するのは先着1台だけになる
+    // （後着は409）。complete前のこの取得自体を原子化することで、GET〜作業完了の
+    // 全期間に及んでいた「両方が着手してしまう」raceを閉じる。
+    // source='owner'限定なのは、review push/pull のQ&Aフロー（waiting→answered。
+    // /api/owner/reviews/:id/answer が status='waiting' を要求する）のタスクを
+    // claimがin_progressへ動かしてしまうと、answerが二度と一致条件を満たせず
+    // 永久に回答不能になるため。
+    const claim = path.match(/^\/api\/device\/reviews\/([^/]+)\/claim$/);
+    if (verb === 'POST' && claim) {
+      const result = await env.DB.prepare(
+        `UPDATE tasks SET status = 'in_progress', device_id = ?1, updated_at = ?2
+         WHERE id = ?3 AND status = 'waiting' AND source = 'owner'`,
+      ).bind(current.id, new Date().toISOString(), claim[1]).run();
+      if (!result.meta.changes) return json(env, 409, { error: 'This request is expired or already used' });
+      const row = await env.DB.prepare(`${TASK_SELECT} WHERE t.id = ?1`).bind(claim[1]).first<TaskRow>();
+      return json(env, 200, { item: publicTask(row!) });
+    }
     const complete = path.match(/^\/api\/device\/reviews\/([^/]+)\/complete$/);
     if (verb === 'POST' && complete) {
+      // claimでin_progressを取得した本人だけが完了にできる。
+      // （review push/pull のQ&Aフローはcompleteを呼ばずanswered/pullで完結するため、
+      // ここにwaiting直接完了のパスは不要）
       const result = await env.DB.prepare(
         `UPDATE tasks SET status = 'completed', completed_at = ?1, updated_at = ?1
-         WHERE id = ?2 AND (device_id = ?3 OR device_id = ?4)`,
-      ).bind(new Date().toISOString(), complete[1], current.id, OWNER_DEVICE_ID).run();
+         WHERE id = ?2 AND status = 'in_progress' AND device_id = ?3`,
+      ).bind(new Date().toISOString(), complete[1], current.id).run();
       if (!result.meta.changes) return json(env, 409, { error: 'This request is expired or already used' });
       return json(env, 200, { ok: true });
+    }
+    if (verb === 'POST' && path === '/api/device/publish/lock') {
+      const lock = await acquireDevicePublishLock(env, current.id, now);
+      if (!lock) {
+        const deviceRow = await env.DB.prepare('SELECT purging_at FROM devices WHERE id = ?1')
+          .bind(current.id).first<{ purging_at: string | null }>();
+        if (deviceRow?.purging_at) return json(env, 403, { error: 'Device is being purged' });
+        return json(env, 409, { error: 'Publish lock is held' });
+      }
+      return json(env, 200, { token: lock.token, gen: lock.gen, expiresAt: now + PUBLISH_LOCK_TTL_SECONDS });
+    }
+    if (verb === 'POST' && path === '/api/device/publish/renew') {
+      const body = await parseBody(request);
+      const token = clean(body.lockToken, 'lockToken', 200, true);
+      const result = await env.DB.prepare(
+        'UPDATE publish_locks SET expires_at = ?1 WHERE device_id = ?2 AND token = ?3',
+      ).bind(now + PUBLISH_LOCK_TTL_SECONDS, current.id, token).run();
+      if (!result.meta.changes) return json(env, 409, { error: 'Publish lock is not held' });
+      return json(env, 200, { expiresAt: now + PUBLISH_LOCK_TTL_SECONDS });
+    }
+    if (verb === 'POST' && path === '/api/device/publish/commit') {
+      const body = await parseBody(request);
+      const lockToken = clean(body.lockToken, 'lockToken', 200, true);
+      const lockRow = await env.DB.prepare(
+        'SELECT gen FROM publish_locks WHERE device_id = ?1 AND token = ?2 AND expires_at > ?3',
+      ).bind(current.id, lockToken, now).first<{ gen: string }>();
+      if (!lockRow) return json(env, 409, { error: 'Publish lock is not held' });
+      const pages = cleanCommitPages(body.pages);
+      // ここで例外が投げられた場合はD1に一切触れていないため不変（§4.3 step2/3）
+      await verifyUploadedPages(env, current.id, lockRow.gen, pages);
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM pages WHERE device_id = ?1').bind(current.id),
+        ...pages.map((page) => env.DB.prepare(
+          `INSERT INTO pages (device_id, slug, title, source, repository, stream, stream_label, object_key, page_date, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+        ).bind(
+          current.id, page.slug, page.title, page.source, page.repository, page.stream, page.streamLabel,
+          pageObjectKey(current.id, lockRow.gen, page.slug), page.date, page.updatedAt,
+        )),
+      ]);
+      const gcDeleted = await gcStaleGenerations(env, current.id, lockRow.gen, now);
+      await env.DB.prepare('DELETE FROM publish_locks WHERE device_id = ?1 AND token = ?2').bind(current.id, lockToken).run();
+      return json(env, 200, { ok: true, pages: pages.length, gcDeleted });
+    }
+    if (verb === 'POST' && path === '/api/device/shares') {
+      const body = await parseBody(request);
+      return handleShare(env, current.id, body, now);
     }
     return json(env, 404, { error: 'Not found' });
   }

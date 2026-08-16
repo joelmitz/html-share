@@ -25,7 +25,9 @@ CREATE TABLE tasks (
   context TEXT NOT NULL DEFAULT '',
   recommendation TEXT NOT NULL DEFAULT '',
   target TEXT,                  -- プロジェクトの呼び名のヒント（ファイルパスではない）
-  status TEXT NOT NULL,         -- waiting / answered / completed
+  status TEXT NOT NULL,         -- waiting / in_progress / answered / completed
+                                 -- in_progress は source='owner' のinbox項目のみ
+                                 -- （claimで取得。Q&Aフローのwaiting→answeredとは無関係）
   approved INTEGER,
   response_text TEXT,
   created_at TEXT NOT NULL,
