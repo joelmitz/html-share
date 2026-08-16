@@ -870,8 +870,10 @@ test('purge lease renewal re-reads the clock on every batch instead of reusing a
   // 何度書き込んでも区別がつかなかった。
 });
 
-test('purge stops deleting (without renewing further) if the lock is lost mid-run, and reports the remainder', async () => {
-  // lock喪失中の削除継続はlock保護の外側での書き込みになるため、安全側で打ち切る。
+test('purge renews the lease before deleting each batch, and never deletes when renewal fails (regression: ordering)', async () => {
+  // 実装レビューBLOCKER: delete→renewの順だと、deleteに時間がかかってTTLが切れた場合、
+  // そのbatchはlock保護の外側で削除されてしまう。renew（成功確認込み）が先で、
+  // 失敗したらそのbatchのdeleteを一切呼ばないことを直接検証する。
   const f = fixture({ R2_OPERATION_BUDGET: '100' });
   const token = await claimDevice(f, await createPairingCode(f));
   const { deviceId } = await publishPage(f, token, 'demo', '<h1>Demo</h1>');
@@ -883,26 +885,29 @@ test('purge stops deleting (without renewing further) if the lock is lost mid-ru
     f.env, f.context);
   const { token: lockToken } = await lockRes.json() as any;
 
-  let calls = 0;
+  const originalDelete = f.contentBucket.delete.bind(f.contentBucket);
+  let deleteCalls = 0;
+  (f.contentBucket as any).delete = async (...args: unknown[]) => {
+    deleteCalls += 1;
+    return (originalDelete as any)(...args);
+  };
+
+  let renewCalls = 0;
   const nowFn = () => {
-    calls += 1;
-    if (calls === 1) {
-      // 1バッチ目の直後、lockが横取り/失効したと想定してtokenを変えてしまう
-      // （実運用ではTTL失効後に別プロセスがacquirePublishLockした状況に相当）。
-      f.db.database.prepare('UPDATE publish_locks SET token = ?1 WHERE device_id = ?2').run('stolen-token', deviceId);
-    }
+    renewCalls += 1;
+    assert.equal(deleteCalls, 0, 'renewはdeleteより前に呼ばれるはず（まだ一度もdeleteされていないはず）');
+    // ここでlockを奪う（横取り/失効を模す）ことで、直後のUPDATEを失敗させる
+    f.db.database.prepare('UPDATE publish_locks SET token = ?1 WHERE device_id = ?2').run('stolen-token', deviceId);
     return 1_700_000_000;
   };
   const result = await purgeDeviceObjects(f.env, deviceId, lockToken, nowFn);
-  assert.equal(result.done, false); // 全件消し切れていない
-  assert.equal(calls, 1); // 2バッチ目のrenewalには到達しない（1バッチ目で打ち切り）
+  assert.equal(renewCalls, 1);
+  assert.equal(deleteCalls, 0); // renew失敗時はdeleteが一切呼ばれない
+  assert.equal(result.done, false);
+  assert.ok(result.remaining > 0);
 
-  // list/deleteは常にR2の1ページ(最大1000件)単位でバッチ化されるため、lock喪失は
-  // 常にページ境界で検知され、そのページ自体は既に削除済みになる。そのため
-  // remainingは「未取得の後続ページ」を数えない概数（設計どおり）——ここでは
-  // remainingの精度ではなく、未取得分がR2に実際に残っていることを直接確認する。
-  const listed = await f.contentBucket.list({ prefix: `pages/${deviceId}/` });
-  assert.ok(listed.objects.length > 0, '1500件超のうち少なくとも1ページ分は削除継続されず残っているはず');
+  const listed = await f.contentBucket.list({ prefix: `pages/${deviceId}/`, limit: 2000 });
+  assert.equal(listed.objects.length, 1501); // 何も削除されていない（1500 filler + demo自身の1件）
 });
 
 test('GC aborts if the lock or D1 current gen changes mid-run (defense in depth, §4.4)', async () => {

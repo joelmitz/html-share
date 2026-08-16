@@ -428,24 +428,23 @@ export async function purgeDeviceObjects(
         break;
       }
       const batch = keys.slice(index, index + 1000);
-      await env.CONTENT.delete(batch);
-      operations += 1;
-      // 削除に時間がかかってもlockが失効しないよう、バッチ毎に「今の」時刻で
-      // lease延長する。呼び出し時点で固定のnowを使い回すと、時間が経過しても
-      // expires_atが実際には押し上がらず延長になっていなかった（実装レビュー
-      // BLOCKER）。device_id/tokenが一致しUPDATEが1行も当たらない場合は
-      // lockを失った（横取り・失効）とみなし、それ以上の削除はlock保護の外側で
-      // 行うことになるため安全側で打ち切る（今のbatchは既に削除済みなので
-      // remainingには含めない）。
+      // 削除に時間がかかってもlockが失効しないよう、deleteの「前」にバッチ毎の
+      // 「今の」時刻でlease延長する（実装レビューBLOCKER: delete後にrenewしていると、
+      // delete自体に時間がかかってTTLが切れた場合、そのbatchはlock保護の外側で
+      // 削除されてしまう。renewを先に行い、失敗したらそのbatchは削除しない）。
+      // device_id/tokenが一致しUPDATEが1行も当たらない場合はlockを失った
+      // （横取り・失効）とみなし、それ以上の削除を安全側で打ち切る。
       const renewNow = nowFn();
       const renewed = await env.DB.prepare(
         'UPDATE publish_locks SET expires_at = ?1 WHERE device_id = ?2 AND token = ?3',
       ).bind(renewNow + PUBLISH_LOCK_TTL_SECONDS, deviceId, lockToken).run();
       if (!renewed.meta.changes) {
         stopped = true;
-        remaining += keys.length - index - batch.length;
+        remaining += keys.length - index;
         break;
       }
+      await env.CONTENT.delete(batch);
+      operations += 1;
     }
     cursor = listed.truncated ? listed.cursor : undefined;
     if (stopped) break;
