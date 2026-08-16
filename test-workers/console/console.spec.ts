@@ -209,6 +209,34 @@ test('owner request flows to a device via claim and completes (real D1)', async 
   expect(completed.status).toBe(200);
 });
 
+// codexレビューBLOCKER対応（2026-08-16、Stage4）: web/review/index.htmlはtask.deviceNameを
+// 読んで「作業中」バッジにデバイス名を添えるが、以前はモック応答でしか検証しておらず、
+// 実Workerの応答に実際にdeviceNameが乗ることを固定していなかった。ここでは
+// GET /api/owner/reviews（web/review/index.htmlが呼ぶ実エンドポイント）を実D1・実Workerで
+// 叩き、claim中のin_progressアイテムにdeviceNameが含まれることを固定する。
+test('owner reviews list carries the claiming device name on an in_progress item (real D1)', async () => {
+  const deviceToken = await pairDevice('Claim Display PC');
+
+  const posted = await SELF.fetch(`${CONSOLE}/api/owner/reviews`, {
+    method: 'POST', headers: await ownerHeaders(), body: JSON.stringify({ question: '表示確認用の依頼' }),
+  });
+  const { item } = await posted.json() as any;
+
+  const claimed = await SELF.fetch(`${CONSOLE}/api/device/reviews/${item.id}/claim`, {
+    method: 'POST', headers: { 'x-review-device-token': deviceToken }, body: '{}',
+  });
+  expect(claimed.status).toBe(200);
+
+  const ownerView = await SELF.fetch(`${CONSOLE}/api/owner/reviews`, { headers: await ownerHeaders() });
+  expect(ownerView.status).toBe(200);
+  const { items } = await ownerView.json() as any;
+  const claimedItem = items.find((entry: any) => entry.id === item.id);
+  expect(claimedItem).toBeTruthy();
+  expect(claimedItem.status).toBe('in_progress');
+  expect(claimedItem.deviceName).toBe('Claim Display PC');
+  expect(claimedItem.claimedBy).toBeUndefined();
+});
+
 test('a claimed in_progress request is only visible to the claiming device (real D1)', async () => {
   // 自端末が着手前にプロセス停止しても再発見できる必要がある一方、他端末の
   // in_progress一覧を覗ける経路があってはならない（実装レビューの指摘）。

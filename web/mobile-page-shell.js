@@ -353,6 +353,7 @@
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
+          deviceId: currentPage.deviceId,
           slug: currentPage.slug,
           scope: mode === 'i' ? 'internal' : 'public',
           days,
@@ -389,7 +390,7 @@
   readMarksFromStorage();
   const hadLocalReadMarks = knowsReadMarks;
 
-  fetch('/app/manifest.json', { cache: 'no-store' }).then((response) => response.json()).then(async (manifest) => {
+  fetch('/api/owner/pages', { cache: 'no-store' }).then((response) => response.json()).then(async (manifest) => {
     allPages = manifest.pages ?? [];
     const validSources = new Set(allPages.map((page) => page.source));
     hiddenSources = new Set([...hiddenSources].filter((sourceValue) => validSources.has(sourceValue)));

@@ -1097,7 +1097,12 @@ body.page-controls-hidden #page-actions {
   }
 
   async function buildTimedShareUrl(page, mode, days) {
-    const body = JSON.stringify({ slug: page.slug, scope: mode === 'i' ? 'internal' : 'public', days });
+    const body = JSON.stringify({
+      deviceId: page.deviceId,
+      slug: page.slug,
+      scope: mode === 'i' ? 'internal' : 'public',
+      days,
+    });
     const response = await fetch('/api/owner/shares', {
       method: 'POST',
       cache: 'no-store',
@@ -1286,7 +1291,7 @@ body.page-controls-hidden #page-actions {
     if (document.visibilityState === 'visible') refreshInboxDot();
   });
 
-  fetch('manifest.json', { cache: 'no-store' })
+  fetch('/api/owner/pages', { cache: 'no-store' })
     .then((r) => r.json())
     .then(async (data) => {
       meta = data;

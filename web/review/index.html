@@ -224,6 +224,12 @@ main {
 .card.waiting { border-top: 3px solid var(--gold); }
 .card.answered { border-top: 3px solid var(--blue-bright); }
 .card.request.waiting { border-top-color: var(--blue); }
+.card.in_progress { border-top: 3px solid var(--mut); }
+.in-progress-mark {
+  display: inline-flex; align-items: center; gap: .35rem;
+  margin-top: .7rem; padding: .3rem .6rem; border-radius: 999px;
+  color: var(--sub); background: var(--soft); font-size: .72rem; font-weight: 700;
+}
 .meta { display: flex; align-items: center; justify-content: space-between; gap: .7rem; margin-bottom: .55rem; }
 .title { color: var(--sub); font-size: .78rem; font-weight: 700; overflow-wrap: anywhere; }
 .time { flex: none; color: var(--mut); font-size: .7rem; }
@@ -574,6 +580,17 @@ footer {
       const waiting = document.createElement('div');
       waiting.className = 'waiting-mac'; waiting.textContent = 'Macでの取り込み待ち';
       card.append(waiting);
+    } else if (task.status === 'in_progress') {
+      // claim済み（他デバイスが作業中）のカード。承認・コメント送信ボタンは出さない
+      // （二重着手を避けるため）。オーナー削除（discard）は他の状態と同じく常に出す。
+      // 作業デバイス名は deviceName（GET /api/owner/pages の§5.2契約と同じ命名。
+      // claim APIのTaskRow/publicTask()側にも同名で追加する。codexレビューBLOCKER対応
+      // 2026-08-16: 旧名claimedByは実Worker応答に存在しないフィールドで、
+      // 常に「作業中」のみになりデバイス名が出ない不具合だった）
+      const mark = document.createElement('div');
+      mark.className = 'in-progress-mark';
+      mark.textContent = task.deviceName ? `作業中 · ${task.deviceName}` : '作業中';
+      card.append(mark);
     }
     return card;
   }
