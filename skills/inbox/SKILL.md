@@ -7,30 +7,50 @@ description: Read requests the owner placed in HTML共有くん from a phone and
 
 Use the `html-share` CLI. Do not call the review API directly and do not print device tokens.
 
-## 1. Read waiting requests
+## 1. Read requests
 
 ```bash
 html-share review inbox
 ```
 
-- `requests` are unfinished owner requests, oldest first
+- `requests` are unfinished owner requests, oldest first. Each has a `status`:
+  `waiting` (not yet claimed by anyone) or `in_progress` (already claimed by **this** computer,
+  typically left over from before a restart — the CLI only ever returns your own in-progress
+  requests, never another computer's)
 - `target` is a project nickname the owner typed on the phone. It may be `null`. Treat it as a hint, not a filesystem path
 - If the array is empty, say there are no inbox requests and stop
 - If the CLI says this computer is not paired, ask the owner to tap "Macを登録" in the inbox and run `/mobile pair <code>`
 
-## 2. Close every request you picked up, before starting
+## 2. Claim each "waiting" request before starting work on it, one at a time
 
 ```bash
-html-share review complete <id...>
+html-share review claim <id>
 ```
 
-- Close them all now. Do not wait until the work is done
-- The inbox is a handover box, not a progress tracker. A request has no "in progress" state,
-  so anything left open looks identical to a request no computer has picked up yet
-- Closing is not abandoning. Report progress and results in chat as usual
-- Finish what you picked up in this session. If something has to wait,
-  say so in chat — it is no longer in the inbox to remind anyone
+- Claim oldest first. A successful claim moves the request to "in progress" and marks this
+  computer as the owner — no other paired computer can complete it until you do
+- A 409 means another computer already claimed that request first. Skip it and move to the
+  next one. Do not start work on a request you failed to claim
+- **The claim command itself can fail for real reasons** (pairing expired, server error, network
+  timeout) — the CLI exits non-zero in that case. Treat that as a genuine failure, not as "someone
+  else claimed it": stop, report the error in chat, and do not silently move on to the next request
+- Requests already `in_progress` (step 1) are already yours — do not claim them again, go
+  straight to resuming the work
 - Requests expire after 90 days, so do not leave them unread either
+
+## 2b. Close a claimed request once its work is finished
+
+```bash
+html-share review complete <id>
+```
+
+- Complete only requests you claimed in step 2, and only after the work is actually done
+  (unlike the old flow, claiming already marks the request as picked up — completing early
+  is no longer needed to prevent other computers from re-picking it up)
+- If the owner deletes a request you claimed, `complete` will fail — that is expected, not
+  an error to retry. Say in chat that the request was withdrawn
+- If you have to stop partway through, say so in chat. The request stays "in progress" under
+  this computer until you complete it or the owner deletes it
 
 ## 3. Identify the starting folder
 
