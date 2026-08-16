@@ -247,7 +247,14 @@ async function serveStatic(request: Request, env: Env, pathname: string): Promis
   } catch {
     return failure(env, 404, 'Not found.');
   }
-  if (!key || key.endsWith('/')) key = `${key}index.html`;
+  if (!key || key.endsWith('/')) {
+    key = `${key}index.html`;
+  } else if (!(key.split('/').pop() ?? '').includes('.')) {
+    // 拡張子の無い最終セグメント（例: "/app"）は末尾スラッシュ省略のディレクトリ
+    // 要求とみなし、index.html を補う。Access の認証後リダイレクトは元のリク
+    // エストパスへ戻すため、"/app/index.html" ではなく "/app" 単体で来ることがある。
+    key = `${key}/index.html`;
+  }
   if (key.includes('..')) return failure(env, 404, 'Not found.');
   const object = await env.CONSOLE.get(key);
   if (!object) return failure(env, 404, 'Not found.');
