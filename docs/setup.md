@@ -89,7 +89,9 @@ html-share keys store # 署名鍵を wrangler secret として登録
 
 ## アップロード用R2 APIトークン
 
-CLIの `publish` はR2のS3互換APIでアップロードします。ダッシュボードの **R2 → Manage API Tokens** で2つのバケットへの Object Read & Write トークンを発行し、環境変数に設定します。
+CLIの `publish` はcontentバケットへR2のS3互換APIで直接アップロードします（console資産のアップロードはCLIの責務ではなくなりました。configの`consoleBucket`は互換のため残していますが、`publish`では使いません）。ダッシュボードの **R2 → Manage API Tokens** で contentバケットへの **Object Write** トークン（Read/List/Deleteは不要）を発行し、環境変数に設定します。
+
+`publish` はこのマシンがペアリング済みであることも前提とします（`html-share review pair <code>`。ペアリングコードはオーナーコンソールで発行します）。ページの実体は `pages/<このマシンのdeviceId>/<世代>/<slug>/index.html` として世代ごとに分離され、共有中のURLをpublishが壊すことはありません。
 
 ```bash
 export R2_ACCESS_KEY_ID=...
