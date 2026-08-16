@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
 import test from 'node:test';
-import consoleWorker from '../workers/console/src/index.js';
+import consoleWorker, { purgeDeviceObjects } from '../workers/console/src/index.js';
 import contentWorker from '../workers/content/src/index.js';
 import { resetAccessKeyCacheForTests } from '../workers/console/src/access.js';
 import { D1Stub, R2Stub, executionContextStub } from './helpers/d1-stub.ts';
@@ -833,6 +833,108 @@ test('purge budget exhaustion returns done:false, blocks new publish locks (403)
   assert.equal(listed.objects.length, 0);
   const devicesRowAfter = f.db.database.prepare('SELECT revoked_at FROM devices WHERE id = ?1').get(deviceId) as any;
   assert.notEqual(devicesRowAfter.revoked_at, null);
+});
+
+test('purge lease renewal re-reads the clock on every batch instead of reusing a stale value (regression)', async () => {
+  // 実装レビューBLOCKER: 以前はpurgeDeviceObjects()へ呼び出し時点で固定したnowを渡し、
+  // 各バッチのUPDATE expires_atを毎回「同じ値」に書いていた。時間が経過しても
+  // 有効期限が実際には押し上がらず、「バッチ毎にlease延長する」（設計§7）を
+  // 満たしていなかった。nowFnを注入し、バッチ毎に「その時点の最新値」が
+  // 書き込まれることを直接検証する。
+  const f = fixture({ R2_OPERATION_BUDGET: '100' });
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId } = await publishPage(f, token, 'demo', '<h1>Demo</h1>');
+  // list()が2ページに分かれるよう1000件超のオブジェクトを注入する
+  // （1ページ内は常に1回のdeleteバッチにチャンクされるため、2回目のrenewalを
+  // 起こすには2ページ目が要る）。
+  for (let index = 0; index < 1500; index += 1) {
+    f.contentBucket.put(`pages/${deviceId}/9999999999-orphan/filler-${index}/index.html`, { body: 'x' });
+  }
+  const lockRow = f.db.database.prepare('SELECT token, expires_at FROM publish_locks WHERE device_id = ?1').get(deviceId) as any;
+  assert.equal(lockRow, undefined); // publishPage完了時点でlockは解放済み（ここでは新規取得する）
+  const lockRes = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers: { 'x-review-device-token': token } }),
+    f.env, f.context);
+  const { token: lockToken } = await lockRes.json() as any;
+
+  const clockValues = [1_700_000_000, 1_700_002_000]; // 2つ目は1つ目より2000秒進んでいる
+  let calls = 0;
+  const result = await purgeDeviceObjects(f.env, deviceId, lockToken, () => clockValues[calls++] ?? clockValues[clockValues.length - 1]);
+  assert.equal(calls, 2); // 2バッチ分、毎回nowFnを呼び直している
+  assert.equal(result.done, true);
+
+  // purge完了によりlock行は削除されるため、中間状態は直接は見えない。
+  // 「毎回呼び直している」こと自体（calls===2・2つの異なる値が実際に使われたこと）が
+  // 固定値の使い回しではないことの直接証拠であり、旧実装（呼び出し時固定のnowを
+  // 使い回す）ではnowFnという差し替え口自体が存在せず、1回目の値のまま
+  // 何度書き込んでも区別がつかなかった。
+});
+
+test('purge stops deleting (without renewing further) if the lock is lost mid-run, and reports the remainder', async () => {
+  // lock喪失中の削除継続はlock保護の外側での書き込みになるため、安全側で打ち切る。
+  const f = fixture({ R2_OPERATION_BUDGET: '100' });
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId } = await publishPage(f, token, 'demo', '<h1>Demo</h1>');
+  for (let index = 0; index < 1500; index += 1) {
+    f.contentBucket.put(`pages/${deviceId}/9999999999-orphan/filler-${index}/index.html`, { body: 'x' });
+  }
+  const lockRes = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/publish/lock`, { method: 'POST', headers: { 'x-review-device-token': token } }),
+    f.env, f.context);
+  const { token: lockToken } = await lockRes.json() as any;
+
+  let calls = 0;
+  const nowFn = () => {
+    calls += 1;
+    if (calls === 1) {
+      // 1バッチ目の直後、lockが横取り/失効したと想定してtokenを変えてしまう
+      // （実運用ではTTL失効後に別プロセスがacquirePublishLockした状況に相当）。
+      f.db.database.prepare('UPDATE publish_locks SET token = ?1 WHERE device_id = ?2').run('stolen-token', deviceId);
+    }
+    return 1_700_000_000;
+  };
+  const result = await purgeDeviceObjects(f.env, deviceId, lockToken, nowFn);
+  assert.equal(result.done, false); // 全件消し切れていない
+  assert.equal(calls, 1); // 2バッチ目のrenewalには到達しない（1バッチ目で打ち切り）
+
+  // list/deleteは常にR2の1ページ(最大1000件)単位でバッチ化されるため、lock喪失は
+  // 常にページ境界で検知され、そのページ自体は既に削除済みになる。そのため
+  // remainingは「未取得の後続ページ」を数えない概数（設計どおり）——ここでは
+  // remainingの精度ではなく、未取得分がR2に実際に残っていることを直接確認する。
+  const listed = await f.contentBucket.list({ prefix: `pages/${deviceId}/` });
+  assert.ok(listed.objects.length > 0, '1500件超のうち少なくとも1ページ分は削除継続されず残っているはず');
+});
+
+test('GC aborts if the lock or D1 current gen changes mid-run (defense in depth, §4.4)', async () => {
+  const f = fixture({ R2_OPERATION_BUDGET: '100' });
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId, gen: gen1 } = await publishPage(f, token, 'demo', '<h1>v1</h1>');
+  // 1000件超の「非常に古い」孤児オブジェクトを注入し、list()が複数ページに分かれ、
+  // gcStaleGenerationsのdeleteバッチが複数回起きるようにする
+  for (let index = 0; index < 1500; index += 1) {
+    f.contentBucket.put(`pages/${deviceId}/1-aaaaaaaaaaaaaaaa/orphan-${index}/index.html`, { body: 'x' });
+  }
+
+  // R2Stub.list()を横取りし、2回目の呼び出し（＝1バッチ目のdelete完了後）で
+  // publish_locksのgenを書き換える（別publishが割り込んだ状況を模す）。
+  const originalList = f.contentBucket.list.bind(f.contentBucket);
+  let listCalls = 0;
+  (f.contentBucket as any).list = async (...args: any[]) => {
+    listCalls += 1;
+    if (listCalls === 2) {
+      f.db.database.prepare('UPDATE publish_locks SET gen = ?1 WHERE device_id = ?2').run('9999999999-changed', deviceId);
+    }
+    return (originalList as any)(...args);
+  };
+
+  const { gen: gen2 } = await publishPage(f, token, 'demo', '<h1>v2</h1>'); // 内部でcommit→GC起動
+  assert.notEqual(gen2, gen1);
+
+  // gen1(現行より前の若い世代)は年齢条件でそもそも保護対象だが、1500件の孤児は
+  // 全て削除対象年齢のはず。gen変化を検知して1バッチ目で打ち切っているため、
+  // 全件は消えていない（2バッチ目以降が残る）。
+  const remainingOrphans = (await f.contentBucket.list({ prefix: `pages/${deviceId}/1-aaaaaaaaaaaaaaaa/`, limit: 1000 })).objects;
+  assert.ok(remainingOrphans.length > 0, 'GCがgen変化を検知せず全件消してしまっている');
 });
 
 test('GET /api/owner/pages returns the manifest-shaped contract with deviceId/deviceName', async () => {

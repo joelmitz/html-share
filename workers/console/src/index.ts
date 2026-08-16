@@ -327,7 +327,13 @@ async function verifyUploadedPages(env: Env, deviceId: string, gen: string, page
 // 年齢ベースの世代GC（§4.4）。現行世代でない、かつmaximumShareDaysより古い
 // オブジェクトだけを削除する。進行中・直近の世代は年齢条件だけで構造的に対象外
 // になるため、ゾンビプロセスの再開やlock TTLの超過とは独立に安全。
-async function gcStaleGenerations(env: Env, deviceId: string, currentGen: string, now: number): Promise<number> {
+// 加えて、各deleteバッチの直前にlock保持者（token）とD1現行gen（publish_locks.gen。
+// 呼び出し時点ではまだ解放されていない）を再読し、不変であることを確認する
+// （§4.4の多重防御。年齢条件だけで既に安全だが、lock喪失や別publishによる
+// gen更新が起きていたらそこでGCを打ち切る）。
+async function gcStaleGenerations(
+  env: Env, deviceId: string, currentGen: string, lockToken: string, now: number,
+): Promise<number> {
   const maxAgeSeconds = Number(env.MAXIMUM_SHARE_DAYS) * 24 * 60 * 60;
   const budget = r2OperationBudget(env);
   const prefix = `pages/${deviceId}/`;
@@ -346,6 +352,9 @@ async function gcStaleGenerations(env: Env, deviceId: string, currentGen: string
       if (generationAgeSeconds(gen, now) > maxAgeSeconds) staleKeys.push(object.key);
     }
     for (let index = 0; index < staleKeys.length && operations < budget; index += 1000) {
+      const guard = await env.DB.prepare('SELECT token, gen FROM publish_locks WHERE device_id = ?1')
+        .bind(deviceId).first<{ token: string; gen: string }>();
+      if (!guard || guard.token !== lockToken || guard.gen !== currentGen) return deleted;
       const batch = staleKeys.slice(index, index + 1000);
       await env.CONTENT.delete(batch);
       operations += 1;
@@ -395,34 +404,53 @@ async function acquireDevicePublishLock(env: Env, deviceId: string, now: number)
 // 判定はない（対象デバイスは既にpurging状態＝以後publishされないため、残っている
 // オブジェクトは全て不要）。作業量上限は共通のR2_OPERATION_BUDGETを使い、超過時は
 // done:falseとして呼び出し元（curl手順）が次回へ繰り越す。
-async function purgeDeviceObjects(env: Env, deviceId: string, lockToken: string, now: number): Promise<{ done: boolean; remaining: number }> {
+// nowFnは既定でMath.floor(Date.now()/1000)（テストが時刻注入で「バッチ毎に本当に
+// 現在時刻を取り直しているか」を検証できるようにするための差し替え口。本番では
+// 常に既定値のまま使う）。
+export async function purgeDeviceObjects(
+  env: Env, deviceId: string, lockToken: string, nowFn: () => number = () => Math.floor(Date.now() / 1000),
+): Promise<{ done: boolean; remaining: number }> {
   const budget = r2OperationBudget(env);
   const prefix = `pages/${deviceId}/`;
   let cursor: string | undefined;
   let operations = 0;
   let remaining = 0;
-  let truncatedByBudget = false;
+  let stopped = false; // budget超過またはlock喪失のいずれかで打ち切った
   do {
-    if (operations >= budget) { truncatedByBudget = true; break; }
+    if (operations >= budget) { stopped = true; break; }
     const listed = await env.CONTENT.list({ prefix, cursor, limit: 1000 });
     operations += 1;
     const keys = listed.objects.map((object) => object.key);
     for (let index = 0; index < keys.length; index += 1000) {
       if (operations >= budget) {
-        truncatedByBudget = true;
+        stopped = true;
         remaining += keys.length - index;
         break;
       }
-      await env.CONTENT.delete(keys.slice(index, index + 1000));
+      const batch = keys.slice(index, index + 1000);
+      await env.CONTENT.delete(batch);
       operations += 1;
-      // 削除に時間がかかってもlockが失効しないよう、バッチ毎にlease延長する
-      await env.DB.prepare('UPDATE publish_locks SET expires_at = ?1 WHERE device_id = ?2 AND token = ?3')
-        .bind(now + PUBLISH_LOCK_TTL_SECONDS, deviceId, lockToken).run();
+      // 削除に時間がかかってもlockが失効しないよう、バッチ毎に「今の」時刻で
+      // lease延長する。呼び出し時点で固定のnowを使い回すと、時間が経過しても
+      // expires_atが実際には押し上がらず延長になっていなかった（実装レビュー
+      // BLOCKER）。device_id/tokenが一致しUPDATEが1行も当たらない場合は
+      // lockを失った（横取り・失効）とみなし、それ以上の削除はlock保護の外側で
+      // 行うことになるため安全側で打ち切る（今のbatchは既に削除済みなので
+      // remainingには含めない）。
+      const renewNow = nowFn();
+      const renewed = await env.DB.prepare(
+        'UPDATE publish_locks SET expires_at = ?1 WHERE device_id = ?2 AND token = ?3',
+      ).bind(renewNow + PUBLISH_LOCK_TTL_SECONDS, deviceId, lockToken).run();
+      if (!renewed.meta.changes) {
+        stopped = true;
+        remaining += keys.length - index - batch.length;
+        break;
+      }
     }
     cursor = listed.truncated ? listed.cursor : undefined;
-    if (truncatedByBudget) break;
+    if (stopped) break;
   } while (cursor);
-  return { done: !truncatedByBudget && !cursor, remaining };
+  return { done: !stopped && !cursor, remaining };
 }
 
 async function device(request: Request, env: Env): Promise<{ id: string; name: string } | null> {
@@ -713,7 +741,7 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
           env.DB.prepare('DELETE FROM pages WHERE device_id = ?1').bind(deviceId),
         ]);
       }
-      const result = await purgeDeviceObjects(env, deviceId, lock.token, now);
+      const result = await purgeDeviceObjects(env, deviceId, lock.token);
       if (!result.done) {
         await env.DB.prepare('DELETE FROM publish_locks WHERE device_id = ?1 AND token = ?2').bind(deviceId, lock.token).run();
         return json(env, 202, { done: false, ...(result.remaining ? { remaining: result.remaining } : {}) });
@@ -849,7 +877,7 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
           pageObjectKey(current.id, lockRow.gen, page.slug), page.date, page.updatedAt,
         )),
       ]);
-      const gcDeleted = await gcStaleGenerations(env, current.id, lockRow.gen, now);
+      const gcDeleted = await gcStaleGenerations(env, current.id, lockRow.gen, lockToken, now);
       await env.DB.prepare('DELETE FROM publish_locks WHERE device_id = ?1 AND token = ?2').bind(current.id, lockToken).run();
       return json(env, 200, { ok: true, pages: pages.length, gcDeleted });
     }

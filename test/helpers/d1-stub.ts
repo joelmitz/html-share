@@ -119,9 +119,19 @@ export class R2Stub {
     const matched = [...this.objects.entries()]
       .filter(([key]) => key.startsWith(prefix))
       .sort(([a], [b]) => a.localeCompare(b));
-    const start = options.cursor ? Number(options.cursor) : 0;
-    const page = matched.slice(start, start + limit);
-    const truncated = start + page.length < matched.length;
+    // cursorは「直前に返した最後のキー」そのもの（数値インデックスではない）。
+    // purge/GCはlist→delete→（同じcursorで）listを繰り返すため、位置インデックスの
+    // cursorだと直前のdeleteでmatchedが縮み、意味がずれる（本物のR2の一覧は
+    // カーソル発行後の削除でも後続ページの取得が壊れない。実測で判明したバグ:
+    // 1501件を1000件ずつ2ページで取得する際、1ページ目削除後の2ページ目取得が
+    // 空になっていた）。キー文字列そのものをcursorにすれば、direct順序を
+    // 保ったまま「そのキーより後」を返すだけなので、間の削除に影響されない。
+    const startIndex = options.cursor
+      ? matched.findIndex(([key]) => key > options.cursor!)
+      : 0;
+    const from = startIndex === -1 ? matched.length : startIndex;
+    const page = matched.slice(from, from + limit);
+    const truncated = from + page.length < matched.length;
     return {
       objects: page.map(([key, value]) => ({
         key,
@@ -129,7 +139,7 @@ export class R2Stub {
         etag: value.etag ?? createHash('md5').update(value.body).digest('hex'),
       })),
       truncated,
-      ...(truncated ? { cursor: String(start + page.length) } : {}),
+      ...(truncated ? { cursor: page[page.length - 1][0] } : {}),
     };
   }
 
