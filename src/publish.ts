@@ -135,7 +135,13 @@ export function share(config: HtmlShareConfig, query: string, days: number): str
   }
   const buildRoot = path.resolve(config.baseDir, '.html-share', 'build');
   const manifest = JSON.parse(readFileSync(path.join(buildRoot, 'manifest.json'), 'utf8')) as BuildManifest;
-  const matches = manifest.pages.filter((page) => page.slug === query || page.slug.includes(query) || page.title.includes(query));
+  // slugの完全一致を最優先する。他ページのslug/titleの接頭辞になっているだけで
+  // 「複数一致」エラーになっていた（例: report-2026-08-04-141049 と
+  // report-2026-08-04-141049-ja）。完全一致が無いときだけ部分一致にフォールバックする。
+  const exact = manifest.pages.filter((page) => page.slug === query);
+  const matches = exact.length === 1
+    ? exact
+    : manifest.pages.filter((page) => page.slug.includes(query) || page.title.includes(query));
   if (matches.length !== 1) throw new Error(matches.length ? `Multiple pages match ${query}: ${matches.map((p) => p.slug).join(', ')}` : `Page not found: ${query}`);
   return signUrl({
     url: `${contentUrl(config)}/${matches[0].objectKey}`,
