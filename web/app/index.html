@@ -521,6 +521,10 @@ body.page-controls-hidden #page-actions {
               </span>
               <span class="label">インボックス</span>
             </button>
+            <button class="tb-btn" id="logout" type="button" title="ログアウト">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H5v16h4M16 8l4 4-4 4M9 12h11"/></svg>
+              <span class="label">ログアウト</span>
+            </button>
             <button class="tb-btn icon" id="refresh" type="button" aria-label="一覧を更新" title="一覧を更新">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M19 11a7 7 0 1 0 .2 5"/></svg>
             </button>
@@ -1198,6 +1202,7 @@ body.page-controls-hidden #page-actions {
   });
   $('home-btn').addEventListener('click', () => { location.hash = '#/'; });
   $('review').addEventListener('click', () => { location.href = '/review/index.html'; });
+  $('logout').addEventListener('click', () => { location.href = '/auth/logout'; });
   refresh.addEventListener('click', refreshApp);
   pageRefresh.addEventListener('click', refreshApp);
   pageMore.addEventListener('click', () => {

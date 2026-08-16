@@ -35,6 +35,17 @@ test('ships the full dashboard UI and inbox wording', () => {
   assert.match(dashboard, /\/api\/owner\/reviews/);
 });
 
+test('places a logout button to the right of the inbox button', () => {
+  const dashboard = readFileSync(path.join(root, 'web', 'app', 'index.html'), 'utf8');
+  const reviewButton = dashboard.indexOf('id="review"');
+  const logoutButton = dashboard.indexOf('id="logout"');
+  assert.notEqual(reviewButton, -1);
+  assert.notEqual(logoutButton, -1);
+  assert.ok(logoutButton > reviewButton, 'logout button must follow the inbox button in source order');
+  assert.match(dashboard, /id="logout" type="button" title="ログアウト"/);
+  assert.match(dashboard, /\$\('logout'\)\.addEventListener\('click', \(\) => \{ location\.href = '\/auth\/logout'; \}\);/);
+});
+
 test('folds overflowing tables on the viewing origin without network access', () => {
   const tables = readFileSync(path.join(root, 'web', 'mobile-tables.js'), 'utf8');
   const handler = readFileSync(path.join(root, 'workers', 'console', 'src', 'index.ts'), 'utf8');
