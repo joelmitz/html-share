@@ -125,6 +125,11 @@ test('the review inbox shows an in_progress badge with the claiming device name 
   assert.match(review, /task\.status === 'in_progress'/);
   assert.match(review, /in-progress-mark/);
   assert.match(review, /作業中/);
+  // デバイス名フィールドは task.deviceName（GET /api/owner/pages §5.2と同じ命名）。
+  // 旧名 claimedBy は実Worker応答に存在せず常に「作業中」のみになる不具合だった
+  // （codexレビューBLOCKER対応 2026-08-16）。回帰防止のため両方向を固定する
+  assert.match(review, /task\.deviceName/);
+  assert.doesNotMatch(review, /task\.claimedBy/);
   // 承認/送るボタンは `task.status === 'waiting' && !request` のときだけ出す既存条件を
   // in_progress 用の分岐に持ち込んでいないことを確認する（answerボタンを出さない要件）
   const inProgressBranch = review.slice(review.indexOf("task.status === 'in_progress'"));

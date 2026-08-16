@@ -583,10 +583,13 @@ footer {
     } else if (task.status === 'in_progress') {
       // claim済み（他デバイスが作業中）のカード。承認・コメント送信ボタンは出さない
       // （二重着手を避けるため）。オーナー削除（discard）は他の状態と同じく常に出す。
-      // 作業デバイス名はAPI契約未確定のためclaimedByで仮置き（§8.2実装時に確定させる）
+      // 作業デバイス名は deviceName（GET /api/owner/pages の§5.2契約と同じ命名。
+      // claim APIのTaskRow/publicTask()側にも同名で追加する。codexレビューBLOCKER対応
+      // 2026-08-16: 旧名claimedByは実Worker応答に存在しないフィールドで、
+      // 常に「作業中」のみになりデバイス名が出ない不具合だった）
       const mark = document.createElement('div');
       mark.className = 'in-progress-mark';
-      mark.textContent = task.claimedBy ? `作業中 · ${task.claimedBy}` : '作業中';
+      mark.textContent = task.deviceName ? `作業中 · ${task.deviceName}` : '作業中';
       card.append(mark);
     }
     return card;
