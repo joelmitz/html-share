@@ -115,7 +115,7 @@ test('device API rejects unpaired tokens', async () => {
   expect(unknown.status).toBe(401);
 });
 
-test('owner request flows to a device and completes (real D1)', async () => {
+test('owner request flows to a device via claim and completes (real D1)', async () => {
   const pairing = await SELF.fetch(`${CONSOLE}/api/owner/pairings`, {
     method: 'POST', headers: await ownerHeaders(),
   });
@@ -139,6 +139,12 @@ test('owner request flows to a device and completes (real D1)', async () => {
   });
   const { items } = await pulled.json() as any;
   expect(items.some((entry: any) => entry.id === item.id)).toBe(true);
+
+  const claimed = await SELF.fetch(`${CONSOLE}/api/device/reviews/${item.id}/claim`, {
+    method: 'POST', headers: { 'x-review-device-token': deviceToken }, body: '{}',
+  });
+  expect(claimed.status).toBe(200);
+  expect((await claimed.json() as any).item.status).toBe('in_progress');
 
   const completed = await SELF.fetch(`${CONSOLE}/api/device/reviews/${item.id}/complete`, {
     method: 'POST', headers: { 'x-review-device-token': deviceToken }, body: '{}',

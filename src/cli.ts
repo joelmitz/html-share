@@ -4,6 +4,7 @@ import { buildOnly, publish, share } from './publish.js';
 import { initializeKeys, storePrivateKey } from './keys.js';
 import { addPageToConfig, loadConfig } from './config.js';
 import {
+  claimReviews,
   completeReviews,
   listInbox,
   pair,
@@ -43,6 +44,7 @@ Usage:
   html-share review push --session <id> [--file cards.json]
   html-share review pull [--session <id>]
   html-share review inbox
+  html-share review claim <id...>
   html-share review complete <id...>
   html-share review watch --session <id> [--timeout-minutes 240]
   html-share review stop --session <id>`);
@@ -124,13 +126,21 @@ async function main(): Promise<void> {
       // The hint travels with the data so an agent that skipped the skill still closes what it
       // picked up. A request left open is indistinguishable from one no computer has taken yet.
       const next = requests.length
-        ? 'Oldest first. Close them all with `html-share review complete <id...>` before starting,'
-          + ' then identify each request\'s working folder and work through them in order.'
+        ? 'Oldest first, one at a time: `html-share review claim <id>` before starting work on it.'
+          + ' A 409 means another computer already claimed it — skip that one and move on.'
+          + ' Only work on requests you successfully claimed.'
           + ' `target` is a nickname hint, not a filesystem path — verify it before using it.'
-          + ' The inbox is a handover box, not a progress tracker, so do not wait for the work to finish.'
+          + ' When a claimed request is finished, close it with `html-share review complete <id>`.'
           + ' Report progress and results in chat.'
         : undefined;
       console.log(JSON.stringify({ ok: true, requests, ...(next ? { next } : {}) }, null, 2));
+      return;
+    }
+    if (action === 'claim') {
+      const ids = process.argv.slice(4).filter((value) => !value.startsWith('--'));
+      if (!ids.length) usage();
+      const results = await claimReviews(config, ids);
+      console.log(JSON.stringify({ ok: true, results }, null, 2));
       return;
     }
     if (action === 'complete') {

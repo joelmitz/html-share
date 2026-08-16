@@ -18,19 +18,32 @@ html-share review inbox
 - If the array is empty, say there are no inbox requests and stop
 - If the CLI says this computer is not paired, ask the owner to tap "Macを登録" in the inbox and run `/mobile pair <code>`
 
-## 2. Close every request you picked up, before starting
+## 2. Claim each request before starting work on it, one at a time
 
 ```bash
-html-share review complete <id...>
+html-share review claim <id>
 ```
 
-- Close them all now. Do not wait until the work is done
-- The inbox is a handover box, not a progress tracker. A request has no "in progress" state,
-  so anything left open looks identical to a request no computer has picked up yet
-- Closing is not abandoning. Report progress and results in chat as usual
-- Finish what you picked up in this session. If something has to wait,
-  say so in chat — it is no longer in the inbox to remind anyone
+- Claim oldest first. A successful claim moves the request to "in progress" and marks this
+  computer as the owner — no other paired computer can complete it until you do
+- A 409 means another computer already claimed that request first. Skip it and move to the
+  next one. Do not start work on a request you failed to claim
+- Only work on requests you successfully claimed
 - Requests expire after 90 days, so do not leave them unread either
+
+## 2b. Close a claimed request once its work is finished
+
+```bash
+html-share review complete <id>
+```
+
+- Complete only requests you claimed in step 2, and only after the work is actually done
+  (unlike the old flow, claiming already marks the request as picked up — completing early
+  is no longer needed to prevent other computers from re-picking it up)
+- If the owner deletes a request you claimed, `complete` will fail — that is expected, not
+  an error to retry. Say in chat that the request was withdrawn
+- If you have to stop partway through, say so in chat. The request stays "in progress" under
+  this computer until you complete it or the owner deletes it
 
 ## 3. Identify the starting folder
 

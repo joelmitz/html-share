@@ -456,12 +456,33 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
         .map(publicTask);
       return json(env, 200, { items });
     }
+    // claim: owner投稿のinbox項目（source='owner'・waiting）を、着手前に原子的に取得する。
+    // 2台が同じ依頼をGETで同時に見つけても、claimに成功するのは先着1台だけになる
+    // （後着は409）。complete前のこの取得自体を原子化することで、GET〜作業完了の
+    // 全期間に及んでいた「両方が着手してしまう」raceを閉じる。
+    // source='owner'限定なのは、review push/pull のQ&Aフロー（waiting→answered。
+    // /api/owner/reviews/:id/answer が status='waiting' を要求する）のタスクを
+    // claimがin_progressへ動かしてしまうと、answerが二度と一致条件を満たせず
+    // 永久に回答不能になるため。
+    const claim = path.match(/^\/api\/device\/reviews\/([^/]+)\/claim$/);
+    if (verb === 'POST' && claim) {
+      const result = await env.DB.prepare(
+        `UPDATE tasks SET status = 'in_progress', device_id = ?1, updated_at = ?2
+         WHERE id = ?3 AND status = 'waiting' AND source = 'owner'`,
+      ).bind(current.id, new Date().toISOString(), claim[1]).run();
+      if (!result.meta.changes) return json(env, 409, { error: 'This request is expired or already used' });
+      const row = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?1').bind(claim[1]).first<TaskRow>();
+      return json(env, 200, { item: publicTask(row!) });
+    }
     const complete = path.match(/^\/api\/device\/reviews\/([^/]+)\/complete$/);
     if (verb === 'POST' && complete) {
+      // claimでin_progressを取得した本人だけが完了にできる。
+      // （review push/pull のQ&Aフローはcompleteを呼ばずanswered/pullで完結するため、
+      // ここにwaiting直接完了のパスは不要）
       const result = await env.DB.prepare(
         `UPDATE tasks SET status = 'completed', completed_at = ?1, updated_at = ?1
-         WHERE id = ?2 AND (device_id = ?3 OR device_id = ?4)`,
-      ).bind(new Date().toISOString(), complete[1], current.id, OWNER_DEVICE_ID).run();
+         WHERE id = ?2 AND status = 'in_progress' AND device_id = ?3`,
+      ).bind(new Date().toISOString(), complete[1], current.id).run();
       if (!result.meta.changes) return json(env, 409, { error: 'This request is expired or already used' });
       return json(env, 200, { ok: true });
     }

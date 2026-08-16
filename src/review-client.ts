@@ -127,6 +127,29 @@ export async function completeReviews(config: HtmlShareConfig, ids: string[]): P
   }
 }
 
+export interface ClaimResult {
+  id: string;
+  ok: boolean;
+  item?: ReviewCard;
+  error?: string;
+}
+
+// completeReviewsと異なり、1件の失敗で全体を止めない。409（他デバイスが先に着手済み）は
+// 正常に起こりうる結果であり、呼び出し側（skill）はそれを見てそのidだけスキップし、
+// 残りのidの作業を続けられる必要があるため。
+export async function claimReviews(config: HtmlShareConfig, ids: string[]): Promise<ClaimResult[]> {
+  const results: ClaimResult[] = [];
+  for (const id of ids) {
+    try {
+      const result = await request(config, `/device/reviews/${encodeURIComponent(id)}/claim`, { method: 'POST', body: {} });
+      results.push({ id, ok: true, item: result.item });
+    } catch (error) {
+      results.push({ id, ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return results;
+}
+
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const pidFile = (sessionId: string) => path.join(
   homedir(),

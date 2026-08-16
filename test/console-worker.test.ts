@@ -76,11 +76,11 @@ async function createPairingCode(f: Fixture): Promise<string> {
   return (await response.json() as any).code;
 }
 
-async function claimDevice(f: Fixture, code: string): Promise<string> {
+async function claimDevice(f: Fixture, code: string, deviceName = 'Test PC'): Promise<string> {
   const response = await consoleWorker.fetch(
     new Request(`${CONSOLE}/api/pairings/claim`, {
       method: 'POST',
-      body: JSON.stringify({ code, deviceName: 'Test PC' }),
+      body: JSON.stringify({ code, deviceName }),
     }), f.env, f.context);
   assert.equal(response.status, 200);
   return (await response.json() as any).deviceToken;
@@ -182,7 +182,7 @@ test('owner API requires a verified Access JWT and same-origin for writes', asyn
   assert.equal(wrongOrigin.status, 403);
 });
 
-test('owner inbox request flows to a paired device and completes', async () => {
+test('owner inbox request flows to a paired device via claim then completes', async () => {
   const f = fixture();
   const token = await claimDevice(f, await createPairingCode(f));
 
@@ -206,6 +206,20 @@ test('owner inbox request flows to a paired device and completes', async () => {
   assert.equal(items.length, 1);
   assert.equal(items[0].id, created.id);
 
+  // completeはclaim済みでないと失敗する（着手前の取得を原子化するのがStage 1の要点）
+  const prematureComplete = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/reviews/${created.id}/complete`, {
+      method: 'POST', headers: { 'x-review-device-token': token }, body: '{}',
+    }), f.env, f.context);
+  assert.equal(prematureComplete.status, 409);
+
+  const claimed = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/reviews/${created.id}/claim`, {
+      method: 'POST', headers: { 'x-review-device-token': token }, body: '{}',
+    }), f.env, f.context);
+  assert.equal(claimed.status, 200);
+  assert.equal((await claimed.json() as any).item.status, 'in_progress');
+
   const completed = await consoleWorker.fetch(
     new Request(`${CONSOLE}/api/device/reviews/${created.id}/complete`, {
       method: 'POST', headers: { 'x-review-device-token': token }, body: '{}',
@@ -217,6 +231,99 @@ test('owner inbox request flows to a paired device and completes', async () => {
   const list = (await after.json() as any).items;
   assert.equal(list[0].status, 'completed');
   assert.ok(list[0].completedAt);
+});
+
+test('claim prevents two devices from starting the same inbox request', async () => {
+  const f = fixture();
+  const tokenA = await claimDevice(f, await createPairingCode(f), 'Device A');
+  const tokenB = await claimDevice(f, await createPairingCode(f), 'Device B');
+
+  const posted = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/reviews`, {
+      method: 'POST', headers: ownerHeaders(),
+      body: JSON.stringify({ question: 'どちらかのPCで拾ってください' }),
+    }), f.env, f.context);
+  const created = (await posted.json() as any).item;
+
+  const claimA = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/reviews/${created.id}/claim`, {
+      method: 'POST', headers: { 'x-review-device-token': tokenA }, body: '{}',
+    }), f.env, f.context);
+  assert.equal(claimA.status, 200);
+
+  // 後着は409（先着が既に着手している旨を検知できる）
+  const claimB = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/reviews/${created.id}/claim`, {
+      method: 'POST', headers: { 'x-review-device-token': tokenB }, body: '{}',
+    }), f.env, f.context);
+  assert.equal(claimB.status, 409);
+
+  // claimしていないBはcompleteもできない
+  const completeB = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/reviews/${created.id}/complete`, {
+      method: 'POST', headers: { 'x-review-device-token': tokenB }, body: '{}',
+    }), f.env, f.context);
+  assert.equal(completeB.status, 409);
+
+  const completeA = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/reviews/${created.id}/complete`, {
+      method: 'POST', headers: { 'x-review-device-token': tokenA }, body: '{}',
+    }), f.env, f.context);
+  assert.equal(completeA.status, 200);
+});
+
+test('owner can delete an in_progress inbox item, orphaning the claiming device\'s complete', async () => {
+  const f = fixture();
+  const token = await claimDevice(f, await createPairingCode(f));
+
+  const posted = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/reviews`, {
+      method: 'POST', headers: ownerHeaders(), body: JSON.stringify({ question: 'やっぱりやめます' }),
+    }), f.env, f.context);
+  const created = (await posted.json() as any).item;
+
+  const claimed = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/reviews/${created.id}/claim`, {
+      method: 'POST', headers: { 'x-review-device-token': token }, body: '{}',
+    }), f.env, f.context);
+  assert.equal(claimed.status, 200);
+
+  const deleted = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/reviews/${created.id}`, { method: 'DELETE', headers: ownerHeaders() }),
+    f.env, f.context);
+  assert.equal(deleted.status, 200);
+
+  // ownerの削除が優先される。claim済みデバイスのcompleteは対象が既に無く失敗する
+  const complete = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/reviews/${created.id}/complete`, {
+      method: 'POST', headers: { 'x-review-device-token': token }, body: '{}',
+    }), f.env, f.context);
+  assert.equal(complete.status, 409);
+});
+
+test('claim only applies to owner-sourced inbox items, not the device Q&A flow', async () => {
+  const f = fixture();
+  const token = await claimDevice(f, await createPairingCode(f));
+
+  const pushed = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/reviews`, {
+      method: 'POST', headers: { 'x-review-device-token': token },
+      body: JSON.stringify({ sessionId: 's1', title: '確認', question: 'これでいいですか' }),
+    }), f.env, f.context);
+  const item = (await pushed.json() as any).item;
+
+  // source='claude-code'のQ&Aタスクはclaim対象外（answerがwaitingを要求し続けられる）
+  const claimed = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/reviews/${item.id}/claim`, {
+      method: 'POST', headers: { 'x-review-device-token': token }, body: '{}',
+    }), f.env, f.context);
+  assert.equal(claimed.status, 409);
+
+  const answered = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/reviews/${item.id}/answer`, {
+      method: 'POST', headers: ownerHeaders(), body: JSON.stringify({ approved: true }),
+    }), f.env, f.context);
+  assert.equal(answered.status, 200);
 });
 
 test('device review is answered once by the owner', async () => {
