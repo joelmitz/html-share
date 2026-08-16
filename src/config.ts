@@ -18,7 +18,6 @@ export interface HtmlShareConfig {
     accountId: string;
     consoleDomain: string;
     contentDomain: string;
-    consoleBucket: string;
     contentBucket: string;
     publicKeyPath: string;
     privateKeyPath: string;
@@ -108,7 +107,6 @@ export function loadConfig(file?: string): HtmlShareConfig {
       accountId,
       consoleDomain,
       contentDomain,
-      consoleBucket: text(cloudflare.consoleBucket, 'cloudflare.consoleBucket'),
       contentBucket: text(cloudflare.contentBucket, 'cloudflare.contentBucket'),
       publicKeyPath: text(cloudflare.publicKeyPath, 'cloudflare.publicKeyPath'),
       privateKeyPath: text(cloudflare.privateKeyPath, 'cloudflare.privateKeyPath'),

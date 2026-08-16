@@ -4,7 +4,7 @@ import test from 'node:test';
 import consoleWorker, { purgeDeviceObjects } from '../workers/console/src/index.js';
 import contentWorker from '../workers/content/src/index.js';
 import { resetAccessKeyCacheForTests } from '../workers/console/src/access.js';
-import { D1Stub, R2Stub, executionContextStub } from './helpers/d1-stub.ts';
+import { AssetsStub, D1Stub, R2Stub, executionContextStub } from './helpers/d1-stub.ts';
 
 const CONSOLE = 'https://console.example.com';
 const CONTENT = 'https://content.example.com';
@@ -37,7 +37,7 @@ function ownerJwt(email = OWNER_EMAIL): string {
 interface Fixture {
   env: any;
   db: D1Stub;
-  consoleBucket: R2Stub;
+  assets: AssetsStub;
   contentBucket: R2Stub;
   context: ExecutionContext;
 }
@@ -47,13 +47,13 @@ function fixture(overrides: Record<string, string> = {}): Fixture {
   (globalThis as any).fetch = async () =>
     new Response(JSON.stringify({ keys: [accessJwk] }), { headers: { 'content-type': 'application/json' } });
   const db = new D1Stub();
-  const consoleBucket = new R2Stub();
-  consoleBucket.put('index.html', { body: '<h1>Landing</h1>', contentType: 'text/html; charset=utf-8' });
-  consoleBucket.put('app/index.html', { body: '<h1>App</h1>', contentType: 'text/html; charset=utf-8' });
+  const assets = new AssetsStub();
+  assets.put('/', { body: '<h1>Landing</h1>', contentType: 'text/html; charset=utf-8' });
+  assets.put('/app/index.html', { body: '<h1>App</h1>', contentType: 'text/html; charset=utf-8' });
   const contentBucket = new R2Stub();
   const env = {
     DB: db,
-    CONSOLE: consoleBucket,
+    ASSETS: assets,
     CONTENT: contentBucket,
     SIGNING_PRIVATE_KEY: signing.privateKey,
     OWNER_EMAIL,
@@ -66,7 +66,7 @@ function fixture(overrides: Record<string, string> = {}): Fixture {
     ACCESS_AUD: AUD,
     ...overrides,
   };
-  return { env, db, consoleBucket, contentBucket, context: executionContextStub() };
+  return { env, db, assets, contentBucket, context: executionContextStub() };
 }
 
 // pages/publish系テスト共通のヘルパー。deviceToken保持者として
@@ -558,13 +558,14 @@ test('static console pages enforce the auth boundary', async () => {
   assert.equal(landing.status, 200); // landingは公開
 
   const blocked = await consoleWorker.fetch(new Request(`${CONSOLE}/app/index.html`), f.env, f.context);
-  assert.equal(blocked.status, 401); // JWT無しの/app/*は拒否
+  assert.equal(blocked.status, 401); // JWT無しの/app/*は拒否——ASSETSへ委譲する前に判定する
 
   const allowed = await consoleWorker.fetch(
     new Request(`${CONSOLE}/app/index.html`, { headers: { 'cf-access-jwt-assertion': ownerJwt() } }),
     f.env, f.context);
   assert.equal(allowed.status, 200);
   assert.equal(await allowed.text(), '<h1>App</h1>');
+  assert.equal(allowed.headers.get('content-security-policy')?.includes('frame-src'), true); // 自前のセキュリティヘッダーが乗る
 
   const login = await consoleWorker.fetch(new Request(`${CONSOLE}/auth/login`), f.env, f.context);
   assert.equal(login.status, 302);
@@ -572,30 +573,26 @@ test('static console pages enforce the auth boundary', async () => {
   const logout = await consoleWorker.fetch(new Request(`${CONSOLE}/auth/logout`), f.env, f.context);
   assert.equal(logout.headers.get('location'), '/cdn-cgi/access/logout');
 
-  const malformed = await consoleWorker.fetch(new Request(`${CONSOLE}/%zz`), f.env, f.context);
-  assert.equal(malformed.status, 404);
+  const missing = await consoleWorker.fetch(new Request(`${CONSOLE}/nope`), f.env, f.context);
+  assert.equal(missing.status, 404); // ASSETSに無いパスは404（未登録スタブなので素通しで確認）
 });
 
-test('redirects a directory path with no trailing slash instead of serving it directly', async () => {
-  // Access認証後のリダイレクトは元のリクエストパスへ戻るため、
-  // "/app/index.html" ではなく末尾スラッシュ省略の "/app" で来ることがある。
-  // ここを直接配信するとブラウザ上のURLが"/app"のままになり、ページ内の
-  // 相対fetch（例: fetch('manifest.json')）が一階層上の"/manifest.json"へ
-  // 解決されてしまうため、末尾スラッシュ付きへ302リダイレクトする。
+test('serveStatic preserves the location header when ASSETS itself redirects (e.g. trailing-slash normalization)', async () => {
+  // ディレクトリ要求の末尾スラッシュ付与・index.html解決はASSETS（プラットフォーム側の
+  // 資産ルーター）の責務であり、本番実測で確認する（移行手順§5.1）。ここで検証するのは
+  // 「ASSETSが3xxを返したとき、自前のヘッダー合成でlocationを消してしまわないか」という
+  // このWorker自身の責務だけ。
   const f = fixture();
-  const noSlash = await consoleWorker.fetch(
+  f.assets.redirect('/app', '/app/');
+  const redirected = await consoleWorker.fetch(
     new Request(`${CONSOLE}/app`, { headers: { 'cf-access-jwt-assertion': ownerJwt() } }), f.env, f.context);
-  assert.equal(noSlash.status, 302);
-  assert.equal(noSlash.headers.get('location'), '/app/');
+  assert.equal(redirected.status, 307);
+  assert.equal(redirected.headers.get('location'), '/app/');
 
-  const withSlash = await consoleWorker.fetch(
-    new Request(`${CONSOLE}/app/`, { headers: { 'cf-access-jwt-assertion': ownerJwt() } }), f.env, f.context);
-  assert.equal(withSlash.status, 200);
-  assert.equal(await withSlash.text(), '<h1>App</h1>');
-
-  // 拡張子を持つファイルパスは従来どおりそのまま解決される（リダイレクトしない）
-  const asset = await consoleWorker.fetch(new Request(`${CONSOLE}/app/index.html`), f.env, f.context);
-  assert.equal(asset.status, 401); // JWTを付けていないので認証境界は健在（404でもリダイレクトでもない）
+  // 認証境界はASSETSへ委譲する前に判定されるため、JWTが無ければredirectにすら
+  // 到達せず401のまま（bareパスでも "/app/" 相当のprefixチェックが効くことの確認）
+  const blocked = await consoleWorker.fetch(new Request(`${CONSOLE}/app`), f.env, f.context);
+  assert.equal(blocked.status, 401);
 });
 
 test('publish lock: concurrent second lock is rejected, renew extends TTL, released lock cannot be reused', async () => {
