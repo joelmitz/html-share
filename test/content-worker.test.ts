@@ -94,9 +94,9 @@ test('enforces internal CIDRs against CF-Connecting-IP', async () => {
 
 test('rejects moving the CIDR parameter out of the signed payload', async () => {
   const { privateKeyPath, env } = fixture();
-  // CIDR無しで署名したURLに、後からiを付けても署名不一致になる
+  // CIDR無しで署名したURLに、後からi（接続元IPを含む帯）を付けても署名不一致になる
   const signed = new URL(signUrl({ url: `${CONTENT}/pages/demo/index.html`, privateKeyPath, days: 1 }));
-  signed.searchParams.set('i', Buffer.from(JSON.stringify(['0.0.0.0/0'])).toString('base64url'));
+  signed.searchParams.set('i', Buffer.from(JSON.stringify(['203.0.113.0/24'])).toString('base64url'));
   const response = await contentWorker.fetch(
     new Request(signed.toString(), { headers: { 'cf-connecting-ip': '203.0.113.7' } }), env);
   assert.equal(response.status, 403);

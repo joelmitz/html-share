@@ -15,11 +15,16 @@ interface CachedKeys {
 }
 
 const KEY_TTL_MILLISECONDS = 60 * 60 * 1000;
+// 未知kidによる強制再取得のcooldown。ランダムkidのJWTを大量に送られても
+// certsエンドポイントへのfetchがリクエストごとに増幅しないようにする。
+const FORCED_REFRESH_COOLDOWN_MILLISECONDS = 60 * 1000;
 let cachedKeys: CachedKeys | undefined;
+let lastForcedRefreshAt = 0;
 
 // テスト専用: module scope の certs cache を破棄する（本番コードからは呼ばない）
 export function resetAccessKeyCacheForTests(): void {
   cachedKeys = undefined;
+  lastForcedRefreshAt = 0;
 }
 
 function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
@@ -72,7 +77,9 @@ export async function verifyAccessJwt(token: string, config: AccessConfig): Prom
   if (header.alg !== 'RS256' || !header.kid) return false;
   let key = (await signingKeys(config.teamDomain)).get(header.kid);
   if (!key) {
-    // 鍵rotation直後はcacheに新kidが無い。TTL内でも1回だけ強制再取得する。
+    // 鍵rotation直後はcacheに新kidが無い。TTL内でも強制再取得する（cooldown付き）。
+    if (Date.now() - lastForcedRefreshAt < FORCED_REFRESH_COOLDOWN_MILLISECONDS) return false;
+    lastForcedRefreshAt = Date.now();
     key = (await signingKeys(config.teamDomain, true)).get(header.kid);
     if (!key) return false;
   }

@@ -38,11 +38,12 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p workers/tsconfig.json --noEmit",
     "test": "tsx --test test/*.test.ts",
+    "test:workers": "vitest run -c test-workers/console/vitest.config.mts && vitest run -c test-workers/content/vitest.config.mts",
     "validate:skill": "node scripts/validate-skill.mjs skills/mobile skills/create-html skills/inbox",
     "validate:plugin": "node scripts/validate-plugin.mjs .",
     "security:scan": "node scripts/security-scan.mjs",
     "audit:prod": "npm audit --omit=dev --audit-level=high",
-    "verify": "npm run check && npm test && npm run validate:skill && npm run validate:plugin && npm run security:scan && npm run audit:prod",
+    "verify": "npm run check && npm test && npm run test:workers && npm run validate:skill && npm run validate:plugin && npm run security:scan && npm run audit:prod",
     "preview": "node scripts/preview.mjs .html-share/build/console",
     "deploy:content": "wrangler deploy --config workers/content/wrangler.jsonc",
     "deploy:console": "wrangler deploy --config workers/console/wrangler.jsonc",
@@ -53,13 +54,15 @@
     "yaml": "2.9.0"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.21.3",
     "@cloudflare/workers-types": "^5.20260816.1",
     "@types/node": "26.2.0",
     "tsx": "4.23.12",
     "typescript": "7.0.2",
+    "vitest": "^4.1.10",
     "wrangler": "^4.123.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.5"
   }
 }
