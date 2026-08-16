@@ -3,8 +3,10 @@
   "name": "html-share-content",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
-  // workers.dev を無効にし、カスタムドメイン経由のみで公開する
+  // workers.dev と preview URL を無効にし、カスタムドメイン経由のみで公開する
   "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true },
   "routes": [
     // 閲覧面ドメインに合わせて書き換える
     { "pattern": "html-share-content.example.com", "custom_domain": true }

@@ -16,6 +16,9 @@ export interface Env {
 
 const TASK_TTL_SECONDS = 90 * 24 * 60 * 60;
 const PAIR_TTL_SECONDS = 10 * 60;
+// 期待するJSONは最大でも数百KB（readMarks 800件）。isolateのメモリ(128MB)保護のため
+// Content-Lengthに依存せずstreamを上限まで読み、超過は413で拒否する。
+const MAX_BODY_BYTES = 1024 * 1024;
 const OWNER_DEVICE_ID = 'OWNER';
 const INBOX_SESSION_ID = 'inbox';
 const encoder = new TextEncoder();
@@ -46,10 +49,33 @@ function json(env: Env, statusCode: number, body: unknown): Response {
 }
 
 async function parseBody(request: Request): Promise<Record<string, any>> {
-  const source = await request.text();
-  if (!source) return {};
+  const declared = Number(request.headers.get('content-length') ?? '0');
+  if (declared > MAX_BODY_BYTES) {
+    throw Object.assign(new Error('Request body is too large'), { statusCode: 413 });
+  }
+  const reader = request.body?.getReader();
+  if (!reader) return {};
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BODY_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw Object.assign(new Error('Request body is too large'), { statusCode: 413 });
+    }
+    chunks.push(value);
+  }
+  if (!total) return {};
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
   try {
-    return JSON.parse(source);
+    return JSON.parse(new TextDecoder().decode(merged));
   } catch {
     throw Object.assign(new Error('Invalid JSON'), { statusCode: 400 });
   }
@@ -215,7 +241,12 @@ async function requireOwner(request: Request, env: Env): Promise<boolean> {
 }
 
 async function serveStatic(request: Request, env: Env, pathname: string): Promise<Response> {
-  let key = decodeURIComponent(pathname.replace(/^\/+/, ''));
+  let key: string;
+  try {
+    key = decodeURIComponent(pathname.replace(/^\/+/, ''));
+  } catch {
+    return failure(env, 404, 'Not found.');
+  }
   if (!key || key.endsWith('/')) key = `${key}index.html`;
   if (key.includes('..')) return failure(env, 404, 'Not found.');
   const object = await env.CONSOLE.get(key);
@@ -253,14 +284,25 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
     const body = await parseBody(request);
     const code = normalizeCode(body.code);
     if (code.length !== 8) return json(env, 400, { error: 'Invalid pairing code' });
-    const claimed = await env.DB.prepare(
-      'UPDATE pairings SET claimed_at = ?1 WHERE code_hash = ?2 AND claimed_at IS NULL AND expires_at > ?1',
-    ).bind(now, await sha256Hex(code)).run();
-    if (!claimed.meta.changes) return json(env, 409, { error: 'This request is expired or already used' });
+    const codeHash = await sha256Hex(code);
     const token = randomToken(32);
     const name = clean(body.deviceName, 'deviceName', 80) || 'Computer';
-    await env.DB.prepare('INSERT INTO devices (id, name, created_at) VALUES (?1, ?2, ?3)')
-      .bind(await sha256Hex(token), name, new Date().toISOString()).run();
+    // AWS版TransactWriteの意味論を保つ: batch()は1トランザクションで実行され、
+    // 途中失敗で全体rollbackされる。INSERTは直前のUPDATE（同一トランザクション・
+    // 同一接続）が1行をclaimできた場合のみ行を作る（SQLiteのchanges()で判定。
+    // claim不成立なら0行になり、changes判定で409にする）。
+    const [claimed, inserted] = await env.DB.batch([
+      env.DB.prepare(
+        'UPDATE pairings SET claimed_at = ?1 WHERE code_hash = ?2 AND claimed_at IS NULL AND expires_at > ?1',
+      ).bind(now, codeHash),
+      env.DB.prepare(
+        `INSERT INTO devices (id, name, created_at)
+         SELECT ?1, ?2, ?3 WHERE (SELECT changes()) = 1`,
+      ).bind(await sha256Hex(token), name, new Date().toISOString()),
+    ]);
+    if (!claimed.meta.changes || !inserted.meta.changes) {
+      return json(env, 409, { error: 'This request is expired or already used' });
+    }
     return json(env, 200, { deviceToken: token, deviceName: name });
   }
 

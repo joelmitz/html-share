@@ -17,6 +17,11 @@ interface CachedKeys {
 const KEY_TTL_MILLISECONDS = 60 * 60 * 1000;
 let cachedKeys: CachedKeys | undefined;
 
+// テスト専用: module scope の certs cache を破棄する（本番コードからは呼ばない）
+export function resetAccessKeyCacheForTests(): void {
+  cachedKeys = undefined;
+}
+
 function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
   const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
   const raw = atob(normalized + '='.repeat((4 - (normalized.length % 4)) % 4));
@@ -25,8 +30,8 @@ function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
-async function signingKeys(teamDomain: string): Promise<Map<string, CryptoKey>> {
-  if (cachedKeys && Date.now() - cachedKeys.fetchedAt < KEY_TTL_MILLISECONDS) return cachedKeys.keys;
+async function signingKeys(teamDomain: string, forceRefresh = false): Promise<Map<string, CryptoKey>> {
+  if (!forceRefresh && cachedKeys && Date.now() - cachedKeys.fetchedAt < KEY_TTL_MILLISECONDS) return cachedKeys.keys;
   const response = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`, {
     signal: AbortSignal.timeout(8_000),
   });
@@ -65,8 +70,12 @@ export async function verifyAccessJwt(token: string, config: AccessConfig): Prom
     return false;
   }
   if (header.alg !== 'RS256' || !header.kid) return false;
-  const key = (await signingKeys(config.teamDomain)).get(header.kid);
-  if (!key) return false;
+  let key = (await signingKeys(config.teamDomain)).get(header.kid);
+  if (!key) {
+    // 鍵rotation直後はcacheに新kidが無い。TTL内でも1回だけ強制再取得する。
+    key = (await signingKeys(config.teamDomain, true)).get(header.kid);
+    if (!key) return false;
+  }
   const verified = await crypto.subtle.verify(
     'RSASSA-PKCS1-v1_5',
     key,

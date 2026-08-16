@@ -32,10 +32,13 @@ npx wrangler login
 npx wrangler r2 bucket create html-share-console
 npx wrangler r2 bucket create html-share-content
 npx wrangler d1 create html-share-review
-npx wrangler d1 migrations apply html-share-review --remote --config workers/console/wrangler.jsonc
 ```
 
-`wrangler d1 create` が出力した `database_id` を `workers/console/wrangler.jsonc` へ書き込みます。あわせて両方の `workers/*/wrangler.jsonc` の `routes` と `vars`（ドメイン・オーナーメール等）を自分の値へ書き換えます。
+**先に** `wrangler d1 create` が出力した `database_id` を `workers/console/wrangler.jsonc` へ書き込みます（placeholder のままだと次の migration が失敗します）。あわせて両方の `workers/*/wrangler.jsonc` の `routes` と `vars`（ドメイン・オーナーメール等）を自分の値へ書き換えます。そのうえで migration を適用します。
+
+```bash
+npx wrangler d1 migrations apply html-share-review --remote --config workers/console/wrangler.jsonc
+```
 
 ## Cloudflare Access（管理面ログイン）の設定
 

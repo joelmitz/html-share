@@ -131,7 +131,12 @@ export default {
         return failure(env, 403, 'This URL is limited to the allowed network.');
       }
     }
-    const key = decodeURIComponent(url.pathname.replace(/^\/+/, ''));
+    let key: string;
+    try {
+      key = decodeURIComponent(url.pathname.replace(/^\/+/, ''));
+    } catch {
+      return failure(env, 404, 'Not found.');
+    }
     if (!key || key.includes('..')) return failure(env, 404, 'Not found.');
     const object = await env.CONTENT.get(key);
     if (!object) return failure(env, 404, 'Not found.');
