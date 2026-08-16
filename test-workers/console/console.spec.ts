@@ -152,6 +152,43 @@ test('owner request flows to a device via claim and completes (real D1)', async 
   expect(completed.status).toBe(200);
 });
 
+test('a claimed in_progress request is only visible to the claiming device (real D1)', async () => {
+  // 自端末が着手前にプロセス停止しても再発見できる必要がある一方、他端末の
+  // in_progress一覧を覗ける経路があってはならない（実装レビューの指摘）。
+  async function pairDevice(name: string): Promise<string> {
+    const pairing = await SELF.fetch(`${CONSOLE}/api/owner/pairings`, { method: 'POST', headers: await ownerHeaders() });
+    const { code } = await pairing.json() as any;
+    const claimed = await SELF.fetch(`${CONSOLE}/api/pairings/claim`, {
+      method: 'POST', body: JSON.stringify({ code, deviceName: name }),
+    });
+    return (await claimed.json() as any).deviceToken;
+  }
+  const tokenA = await pairDevice('Device A');
+  const tokenB = await pairDevice('Device B');
+
+  const posted = await SELF.fetch(`${CONSOLE}/api/owner/reviews`, {
+    method: 'POST', headers: await ownerHeaders(), body: JSON.stringify({ question: 'PCで拾ってください' }),
+  });
+  const { item } = await posted.json() as any;
+
+  const claimedByA = await SELF.fetch(`${CONSOLE}/api/device/reviews/${item.id}/claim`, {
+    method: 'POST', headers: { 'x-review-device-token': tokenA }, body: '{}',
+  });
+  expect(claimedByA.status).toBe(200);
+
+  // Aの再発見: 自分がclaimした分は再起動後もin_progressとして見える
+  const seenByA = await SELF.fetch(`${CONSOLE}/api/device/reviews?status=in_progress&sessionId=inbox`, {
+    headers: { 'x-review-device-token': tokenA },
+  });
+  expect((await seenByA.json() as any).items.some((entry: any) => entry.id === item.id)).toBe(true);
+
+  // Bからは見えない（他端末のin_progressを覗く経路が無い）
+  const seenByB = await SELF.fetch(`${CONSOLE}/api/device/reviews?status=in_progress&sessionId=inbox`, {
+    headers: { 'x-review-device-token': tokenB },
+  });
+  expect((await seenByB.json() as any).items.some((entry: any) => entry.id === item.id)).toBe(false);
+});
+
 test('rejects request bodies above the 1MB cap with 413', async () => {
   const oversized = await SELF.fetch(`${CONSOLE}/api/pairings/claim`, {
     method: 'POST',

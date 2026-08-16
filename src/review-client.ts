@@ -77,9 +77,19 @@ async function request(config: HtmlShareConfig, pathname: string, options: {
     signal: AbortSignal.timeout(15_000),
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error ?? `Review API returned ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(payload.error ?? `Review API returned ${response.status}`) as RequestError;
+    error.status = response.status;
+    throw error;
+  }
   return payload;
 }
+
+// HTTPステータスを保持したエラー。呼び出し側（claimReviews等）が「409=正常な競合」と
+// 「それ以外=本当の失敗（認証切れ・サーバ障害・タイムアウト等）」を区別するために使う。
+// fetch自体の失敗（ネットワーク断・AbortSignal.timeout）はstatusを持たないため
+// 区別不要（常に非409＝致命的として扱われる）。
+type RequestError = Error & { status?: number };
 
 export async function pair(config: HtmlShareConfig, code: string, name = `Computer / ${hostname()}`): Promise<string> {
   const result = await request(config, '/pairings/claim', {
@@ -111,8 +121,15 @@ export async function pullReviews(config: HtmlShareConfig, sessionId?: string): 
 }
 
 export async function listInbox(config: HtmlShareConfig): Promise<ReviewCard[]> {
-  const result = await request(config, `/device/reviews?${new URLSearchParams({ status: 'waiting', sessionId: 'inbox' })}`);
-  return [...(result.items ?? [])]
+  // waitingは未着手の依頼、in_progressは「このデバイスが」既にclaim済みで作業途中の依頼
+  // （GET /api/device/reviewsはdevice_id=自分 or OWNERでしか絞り込まないサーバー実装のため、
+  // 他デバイスがclaim中の依頼は含まれない）。プロセス再起動後もin_progressが再発見できる
+  // ようにするため、両方を1回のinboxで返す。
+  const [waiting, inProgress] = await Promise.all([
+    request(config, `/device/reviews?${new URLSearchParams({ status: 'waiting', sessionId: 'inbox' })}`),
+    request(config, `/device/reviews?${new URLSearchParams({ status: 'in_progress', sessionId: 'inbox' })}`),
+  ]);
+  return [...(waiting.items ?? []), ...(inProgress.items ?? [])]
     .filter((item) => item.source === 'owner' || item.sessionId === 'inbox')
     .sort((left, right) => String(left.updatedAt ?? '').localeCompare(String(right.updatedAt ?? '')))
     .map((item) => ({
@@ -134,9 +151,11 @@ export interface ClaimResult {
   error?: string;
 }
 
-// completeReviewsと異なり、1件の失敗で全体を止めない。409（他デバイスが先に着手済み）は
-// 正常に起こりうる結果であり、呼び出し側（skill）はそれを見てそのidだけスキップし、
-// 残りのidの作業を続けられる必要があるため。
+// completeReviewsと異なり、409（他デバイスが先に着手済み）1件だけは全体を止めずその
+// idをスキップして続行する——skillが「409なら次へ」と機械的に判断できるようにするため。
+// それ以外の失敗（401=pairing失効・403・404・500・ネットワーク断・timeout等）は握り潰さず
+// 例外を再送出し、コマンド全体を失敗させる（非0終了）。これらを409と同列に扱うと、
+// 認証切れやサーバ障害を「他PCに取られた」と誤認して作業を続けてしまう。
 export async function claimReviews(config: HtmlShareConfig, ids: string[]): Promise<ClaimResult[]> {
   const results: ClaimResult[] = [];
   for (const id of ids) {
@@ -144,7 +163,11 @@ export async function claimReviews(config: HtmlShareConfig, ids: string[]): Prom
       const result = await request(config, `/device/reviews/${encodeURIComponent(id)}/claim`, { method: 'POST', body: {} });
       results.push({ id, ok: true, item: result.item });
     } catch (error) {
-      results.push({ id, ok: false, error: error instanceof Error ? error.message : String(error) });
+      if ((error as RequestError)?.status === 409) {
+        results.push({ id, ok: false, error: error instanceof Error ? error.message : String(error) });
+        continue;
+      }
+      throw error;
     }
   }
   return results;

@@ -125,12 +125,17 @@ async function main(): Promise<void> {
       const requests = await listInbox(config);
       // The hint travels with the data so an agent that skipped the skill still closes what it
       // picked up. A request left open is indistinguishable from one no computer has taken yet.
+      // requests can include items this same device already claimed (status "in_progress") —
+      // e.g. after a restart mid-work. Those must not be claimed again; resume them directly.
       const next = requests.length
-        ? 'Oldest first, one at a time: `html-share review claim <id>` before starting work on it.'
-          + ' A 409 means another computer already claimed it — skip that one and move on.'
-          + ' Only work on requests you successfully claimed.'
+        ? 'Each request has a `status`. For "waiting" ones, claim before starting work, oldest'
+          + ' first: `html-share review claim <id>`. A 409 means another computer already'
+          + ' claimed it — skip that one and move on. For "in_progress" ones, this computer'
+          + ' already claimed them (likely before a restart) — do not claim again, resume the'
+          + ' work directly. Only work on requests that are "in_progress" or that you just'
+          + ' successfully claimed.'
           + ' `target` is a nickname hint, not a filesystem path — verify it before using it.'
-          + ' When a claimed request is finished, close it with `html-share review complete <id>`.'
+          + ' When a request is finished, close it with `html-share review complete <id>`.'
           + ' Report progress and results in chat.'
         : undefined;
       console.log(JSON.stringify({ ok: true, requests, ...(next ? { next } : {}) }, null, 2));
