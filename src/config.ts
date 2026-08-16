@@ -14,15 +14,14 @@ export interface PageConfig {
 
 export interface HtmlShareConfig {
   ownerEmail: string;
-  aws: {
-    region: string;
+  cloudflare: {
+    accountId: string;
     consoleDomain: string;
     contentDomain: string;
-    certificateArn: string;
-    cognitoDomainPrefix: string;
+    consoleBucket: string;
+    contentBucket: string;
     publicKeyPath: string;
     privateKeyPath: string;
-    privateKeyParameterName: string;
   };
   content: {
     roots: string[];
@@ -84,7 +83,7 @@ export function loadConfig(file?: string): HtmlShareConfig {
     throw new Error(`Config file not found: ${configFile}. Copy html-share.config.example.yaml first.`);
   }
   const raw = parse(readFileSync(configFile, 'utf8')) as Record<string, any>;
-  const aws = raw?.aws ?? {};
+  const cloudflare = raw?.cloudflare ?? {};
   const content = raw?.content ?? {};
   const pages = Array.isArray(content.pages) ? content.pages : [];
   const roots = Array.isArray(content.roots) ? content.roots.map((item: unknown) => text(item, 'content.roots[]')) : [];
@@ -95,25 +94,24 @@ export function loadConfig(file?: string): HtmlShareConfig {
   if (pages.length === 0) throw new Error('content.pages must contain at least one page');
   const ownerEmail = text(raw?.ownerEmail, 'ownerEmail');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ownerEmail)) throw new Error('ownerEmail must be an email address');
-  const consoleDomain = hostname(aws.consoleDomain, 'aws.consoleDomain');
-  const contentDomain = hostname(aws.contentDomain, 'aws.contentDomain');
-  if (consoleDomain === contentDomain) throw new Error('aws.consoleDomain and aws.contentDomain must be different security origins');
-  const certificateArn = text(aws.certificateArn, 'aws.certificateArn');
-  if (!/^arn:aws:acm:us-east-1:\d{12}:certificate\/[0-9a-f-]+$/i.test(certificateArn)) {
-    throw new Error('aws.certificateArn must be an ACM certificate ARN from us-east-1 for CloudFront');
+  const consoleDomain = hostname(cloudflare.consoleDomain, 'cloudflare.consoleDomain');
+  const contentDomain = hostname(cloudflare.contentDomain, 'cloudflare.contentDomain');
+  if (consoleDomain === contentDomain) throw new Error('cloudflare.consoleDomain and cloudflare.contentDomain must be different security origins');
+  const accountId = text(cloudflare.accountId, 'cloudflare.accountId').toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(accountId)) {
+    throw new Error('cloudflare.accountId must be a 32-character Cloudflare account ID');
   }
 
   return {
     ownerEmail,
-    aws: {
-      region: text(aws.region, 'aws.region'),
+    cloudflare: {
+      accountId,
       consoleDomain,
       contentDomain,
-      certificateArn,
-      cognitoDomainPrefix: text(aws.cognitoDomainPrefix, 'aws.cognitoDomainPrefix'),
-      publicKeyPath: text(aws.publicKeyPath, 'aws.publicKeyPath'),
-      privateKeyPath: text(aws.privateKeyPath, 'aws.privateKeyPath'),
-      privateKeyParameterName: text(aws.privateKeyParameterName, 'aws.privateKeyParameterName'),
+      consoleBucket: text(cloudflare.consoleBucket, 'cloudflare.consoleBucket'),
+      contentBucket: text(cloudflare.contentBucket, 'cloudflare.contentBucket'),
+      publicKeyPath: text(cloudflare.publicKeyPath, 'cloudflare.publicKeyPath'),
+      privateKeyPath: text(cloudflare.privateKeyPath, 'cloudflare.privateKeyPath'),
     },
     content: {
       roots,
@@ -164,19 +162,10 @@ export function validatedRoots(config: HtmlShareConfig): string[] {
   });
 }
 
-export interface StackOutputs {
-  ConsoleBucketName: string;
-  ContentBucketName: string;
-  ConsoleUrl: string;
-  ContentUrl: string;
-  CloudFrontPublicKeyId: string;
+export function consoleUrl(config: HtmlShareConfig): string {
+  return `https://${config.cloudflare.consoleDomain}`;
 }
 
-export function loadOutputs(file: string): StackOutputs {
-  const source = JSON.parse(readFileSync(file, 'utf8')) as Record<string, Record<string, string>>;
-  const candidate = Object.values(source).find((value) =>
-    value.ConsoleBucketName && value.ContentBucketName && value.ContentUrl && value.CloudFrontPublicKeyId,
-  );
-  if (!candidate) throw new Error(`CDK outputs are incomplete: ${file}`);
-  return candidate as unknown as StackOutputs;
+export function contentUrl(config: HtmlShareConfig): string {
+  return `https://${config.cloudflare.contentDomain}`;
 }

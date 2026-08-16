@@ -11,15 +11,14 @@ function fixture(): { root: string; config: string } {
   writeFileSync(path.join(root, 'pages', 'demo.html'), '<h1>Demo</h1>');
   const config = path.join(root, 'html-share.config.yaml');
   writeFileSync(config, `ownerEmail: owner@example.com
-aws:
-  region: ap-northeast-1
+cloudflare:
+  accountId: "0123456789abcdef0123456789abcdef"
   consoleDomain: console.example.com
   contentDomain: content.example.com
-  certificateArn: arn:aws:acm:us-east-1:111122223333:certificate/00000000-0000-4000-8000-000000000000
-  cognitoDomainPrefix: html-share-test
+  consoleBucket: html-share-console
+  contentBucket: html-share-content
   publicKeyPath: .html-share/keys/public.pem
   privateKeyPath: .html-share/keys/private.pem
-  privateKeyParameterName: /html-share/test/private-key
 content:
   roots: [pages]
   allowedInternalCidrs: [203.0.113.0/24]

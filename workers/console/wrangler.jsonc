@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "html-share-console",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  // workers.dev を無効にし、Access で保護されたカスタムドメイン経由のみで公開する
+  "workers_dev": false,
+  "routes": [
+    // 管理面ドメインに合わせて書き換える
+    { "pattern": "html-share-console.example.com", "custom_domain": true }
+  ],
+  "r2_buckets": [
+    { "binding": "CONSOLE", "bucket_name": "html-share-console" }
+  ],
+  "d1_databases": [
+    // database_id は `wrangler d1 create html-share-review` の出力で書き換える
+    { "binding": "DB", "database_name": "html-share-review", "database_id": "00000000-0000-0000-0000-000000000000" }
+  ],
+  "vars": {
+    // すべて自分の環境に合わせて書き換える
+    "OWNER_EMAIL": "owner@example.com",
+    "CONSOLE_ORIGIN": "https://html-share-console.example.com",
+    "CONTENT_ORIGIN": "https://html-share-content.example.com",
+    "MAXIMUM_SHARE_DAYS": "30",
+    "ALLOWED_INTERNAL_CIDRS": "[]",
+    // Zero Trust のチーム名（<team>.cloudflareaccess.com）と Access アプリの AUD タグ
+    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
+    "ACCESS_AUD": ""
+  }
+  // SIGNING_PRIVATE_KEY は `html-share keys store`（wrangler secret put）で登録する
+}

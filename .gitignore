@@ -1,6 +1,5 @@
 node_modules/
 dist/
-cdk.out/
 .html-share/
 html-share.config.yaml
 *.log

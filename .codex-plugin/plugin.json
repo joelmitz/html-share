@@ -9,7 +9,7 @@
   "homepage": "https://github.com/minorun365/html-share#readme",
   "repository": "https://github.com/minorun365/html-share",
   "license": "Apache-2.0",
-  "keywords": ["claude-code", "codex", "html", "mobile", "review", "aws"],
+  "keywords": ["claude-code", "codex", "html", "mobile", "review", "cloudflare"],
   "skills": "./skills/",
   "interface": {
     "displayName": "HTML共有くん",

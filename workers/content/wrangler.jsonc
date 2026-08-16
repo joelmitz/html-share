@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "html-share-content",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  // workers.dev を無効にし、カスタムドメイン経由のみで公開する
+  "workers_dev": false,
+  "routes": [
+    // 閲覧面ドメインに合わせて書き換える
+    { "pattern": "html-share-content.example.com", "custom_domain": true }
+  ],
+  "r2_buckets": [
+    { "binding": "CONTENT", "bucket_name": "html-share-content" }
+  ],
+  "vars": {
+    // 管理面オリジン（frame-ancestors 用）。書き換える
+    "CONSOLE_ORIGIN": "https://html-share-console.example.com"
+  }
+  // SIGNING_PUBLIC_KEY は `html-share keys store`（wrangler secret put）で登録する
+}

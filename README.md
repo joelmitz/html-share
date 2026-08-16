@@ -1,6 +1,9 @@
-# HTML共有くん
+# HTML共有くん（Cloudflare版）
 
-HTML共有くんは、AIコーディングエージェントに作らせたHTMLを1か所へためて、スマホからも読めるようにするツールです。自分のAWSアカウントで動かすセルフホスト型で、作者へページや回答が送られることはありません。
+> [!NOTE]
+> これは [minorun365/html-share](https://github.com/minorun365/html-share)（AWS版）のforkで、実行基盤をCloudflare（Workers / R2 / D1 / Access）へ置き換えたものです。CLI・スキル・使い方は本家と同じです。
+
+HTML共有くんは、AIコーディングエージェントに作らせたHTMLを1か所へためて、スマホからも読めるようにするツールです。自分のCloudflareアカウントで動かすセルフホスト型で、作者へページや回答が送られることはありません。
 
 <p align="center">
   <img src="docs/images/dashboard.png" alt="HTML共有くんのメインダッシュボード" width="66%">
