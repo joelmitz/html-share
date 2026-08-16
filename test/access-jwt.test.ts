@@ -94,6 +94,17 @@ test('access jwt verification', async (t) => {
     assert.equal(await verifyAccessJwt(makeJwt(privateKey, { kid: 'k1' }), CONFIG), true);
   });
 
+  await t.test('does not refetch certs for a second unknown kid within the cooldown', async () => {
+    const { privateKey, jwk } = keyPair();
+    const count = stubCerts([[{ ...jwk, kid: 'other' }]]);
+    // 1回目の未知kid: cache構築 + 強制refreshで計2 fetch
+    assert.equal(await verifyAccessJwt(makeJwt(privateKey, { kid: 'k1' }), CONFIG), false);
+    assert.equal(count(), 2);
+    // cooldown中の2回目の未知kid: 追加fetchせず即false
+    assert.equal(await verifyAccessJwt(makeJwt(privateKey, { kid: 'k2' }), CONFIG), false);
+    assert.equal(count(), 2);
+  });
+
   await t.test('rejects a wrong audience', async () => {
     const { privateKey, jwk } = keyPair();
     stubCerts([[{ ...jwk, kid: 'k1' }]]);
