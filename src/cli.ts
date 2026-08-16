@@ -52,6 +52,20 @@ Usage:
 async function main(): Promise<void> {
   const command = process.argv[2];
   if (!command || flag('--help') || flag('-h')) usage();
+
+  // page add は addPageToConfig() が生YAMLを直接読み書きするだけで、loadConfig()
+  // が要求するcontent.pagesの非空制約を必要としない。新規セットアップ直後
+  // （content.pagesがまだ空）で最初の1件を追加するための唯一の手段でもあるため、
+  // 他コマンドより先に、loadConfig()を呼ばずに処理する。
+  if (command === 'page') {
+    const action = process.argv[3];
+    const pagePath = process.argv[4];
+    if (action !== 'add' || !pagePath) usage();
+    const added = addPageToConfig(option('--config'), pagePath, option('--title'));
+    console.log(JSON.stringify({ ok: true, added, path: pagePath }));
+    return;
+  }
+
   const config = loadConfig(option('--config'));
 
   if (command === 'build') {
@@ -68,14 +82,6 @@ async function main(): Promise<void> {
     if (!query) usage();
     const days = Number(option('--days') ?? 7);
     console.log(share(config, query, days));
-    return;
-  }
-  if (command === 'page') {
-    const action = process.argv[3];
-    const pagePath = process.argv[4];
-    if (action !== 'add' || !pagePath) usage();
-    const added = addPageToConfig(option('--config'), pagePath, option('--title'));
-    console.log(JSON.stringify({ ok: true, added, path: pagePath }));
     return;
   }
   if (command === 'keys') {
