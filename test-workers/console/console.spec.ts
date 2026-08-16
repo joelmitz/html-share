@@ -3,7 +3,7 @@
 // Access certs エンドポイントは vitest.config.mts の outboundService でモックされる。
 import { createHash } from 'node:crypto';
 import { SELF, env } from 'cloudflare:test';
-import { beforeAll, expect, test } from 'vitest';
+import { expect, test } from 'vitest';
 
 const CONSOLE = 'https://console.example.com';
 const testEnv = env as any;
@@ -47,15 +47,6 @@ async function ownerJwt(email: string = testEnv.OWNER_EMAIL): Promise<string> {
 async function ownerHeaders(): Promise<Record<string, string>> {
   return { 'cf-access-jwt-assertion': await ownerJwt(), origin: testEnv.CONSOLE_ORIGIN };
 }
-
-beforeAll(async () => {
-  await testEnv.CONSOLE.put('index.html', '<h1>Landing</h1>', {
-    httpMetadata: { contentType: 'text/html; charset=utf-8' },
-  });
-  await testEnv.CONSOLE.put('app/index.html', '<h1>App</h1>', {
-    httpMetadata: { contentType: 'text/html; charset=utf-8' },
-  });
-});
 
 async function pairDevice(name: string): Promise<string> {
   const pairing = await SELF.fetch(`${CONSOLE}/api/owner/pairings`, { method: 'POST', headers: await ownerHeaders() });
@@ -132,6 +123,14 @@ test('auth boundary: landing is public, /app and owner API require Access JWT', 
     headers: { 'cf-access-jwt-assertion': await ownerJwt() },
   });
   expect(allowedPage.status).toBe(200);
+  expect(await allowedPage.text()).toBe('<h1>App</h1>');
+  // ASSETS（env.ASSETS.fetch経由）の応答にも、他のレスポンスと同じセキュリティ
+  // ヘッダーが自前で重ねられていることを確認する（設計§5、serveStatic参照）。
+  expect(allowedPage.headers.get('content-security-policy')).toContain('frame-src');
+  expect(allowedPage.headers.get('x-frame-options')).toBe('DENY');
+
+  const missing = await SELF.fetch(`${CONSOLE}/nope-not-registered`);
+  expect(missing.status).toBe(404);
 });
 
 test('pairing claim succeeds once and is rejected afterwards (real D1)', async () => {

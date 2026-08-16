@@ -148,6 +148,43 @@ export class R2Stub {
   }
 }
 
+export interface AssetsStubFile {
+  body: string;
+  contentType?: string;
+}
+
+// env.ASSETS（Workers Static Assets binding、設計§5）の最小スタブ。
+// ディレクトリ要求の末尾スラッシュ付与・index.html解決・パストラバーサル対策は
+// 本物のASSETSがプラットフォーム側で担う機能であり、ここでは再現しない
+// （それを検証するのはこのテストスイートの責務ではない——本番実測で確認する。
+// 移行手順§5.1のPhase A検証ゲート参照）。ここで検証したいのは「認証ゲートを
+// 通過した後、ASSETSの応答へ自前のセキュリティヘッダーが正しく重ねられるか」
+// だけなので、固定パス→固定応答の単純なルックアップに留める。
+export class AssetsStub {
+  private readonly files = new Map<string, AssetsStubFile>();
+  private readonly redirects = new Map<string, string>();
+
+  put(pathname: string, value: AssetsStubFile): void {
+    this.files.set(pathname, value);
+  }
+
+  redirect(pathname: string, location: string): void {
+    this.redirects.set(pathname, location);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const pathname = new URL(request.url).pathname;
+    const location = this.redirects.get(pathname);
+    if (location) return new Response(null, { status: 307, headers: { location } });
+    const file = this.files.get(pathname);
+    if (!file) return new Response('Not Found', { status: 404, headers: { 'content-type': 'text/plain' } });
+    return new Response(request.method === 'HEAD' ? null : file.body, {
+      status: 200,
+      headers: { 'content-type': file.contentType ?? 'application/octet-stream' },
+    });
+  }
+}
+
 export function executionContextStub(): ExecutionContext {
   return {
     waitUntil(promise: Promise<unknown>): void {

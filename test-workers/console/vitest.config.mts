@@ -31,7 +31,24 @@ export default defineConfig(async () => {
           compatibilityDate: '2026-08-01',
           compatibilityFlags: ['nodejs_compat'],
           d1Databases: ['DB'],
-          r2Buckets: ['CONSOLE', 'CONTENT'],
+          r2Buckets: ['CONTENT'],
+          // env.ASSETS（Workers Static Assets、設計§5）のスタブ。ディレクトリ要求の
+          // 末尾スラッシュ付与・index.html解決はASSETS自体（プラットフォーム機能）の
+          // 責務であり本番実測で確認する（移行手順§5.1）。ここでの関数バインディングは
+          // 「認証ゲート通過後にASSETSへ委譲され、その応答へ自前のセキュリティヘッダーが
+          // 正しく重ねられる」というWorker自身の責務だけを検証するための最小スタブ。
+          serviceBindings: {
+            ASSETS(request: Request) {
+              const pathname = new URL(request.url).pathname;
+              if (pathname === '/') {
+                return new Response('<h1>Landing</h1>', { headers: { 'content-type': 'text/html; charset=utf-8' } });
+              }
+              if (pathname === '/app/index.html') {
+                return new Response('<h1>App</h1>', { headers: { 'content-type': 'text/html; charset=utf-8' } });
+              }
+              return new Response('Not Found', { status: 404, headers: { 'content-type': 'text/plain' } });
+            },
+          },
           // Worker からの外部fetchをNode側でモックする（Access certsエンドポイントのみ許可）
           outboundService(request: Request) {
             const url = new URL(request.url);

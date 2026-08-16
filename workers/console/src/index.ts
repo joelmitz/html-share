@@ -3,7 +3,10 @@ import { cleanReadMarks } from './read-marks.js';
 
 export interface Env {
   DB: D1Database;
-  CONSOLE: R2Bucket;
+  // Workers Static Assets（設計§5）。web/配下の静的資産はwranglerが世代ごと
+  // 原子的にデプロイする。CONSOLE R2バケットは廃止（旧console参照はゼロにする、
+  // 移行手順§5.1のPhase A検証ゲート(d)）。
+  ASSETS: Fetcher;
   CONTENT: R2Bucket;
   SIGNING_PRIVATE_KEY: string;
   OWNER_EMAIL: string;
@@ -545,33 +548,19 @@ async function requireOwner(request: Request, env: Env): Promise<boolean> {
   });
 }
 
-async function serveStatic(request: Request, env: Env, pathname: string): Promise<Response> {
-  let key: string;
-  try {
-    key = decodeURIComponent(pathname.replace(/^\/+/, ''));
-  } catch {
-    return failure(env, 404, 'Not found.');
-  }
-  if (!key || key.endsWith('/')) {
-    key = `${key}index.html`;
-  } else if (!(key.split('/').pop() ?? '').includes('.')) {
-    // 拡張子の無い最終セグメント（例: "/app"）は末尾スラッシュ省略のディレクトリ
-    // 要求とみなす。Accessの認証後リダイレクトは元のリクエストパスへ戻すため、
-    // "/app/index.html" ではなく "/app" 単体で来ることがある。
-    // ここをその場でindex.htmlとして直接配信すると、ブラウザ上のURLは"/app"
-    // のままになり、ページ内の相対fetch（例: fetch('manifest.json')）が
-    // "/app/manifest.json" ではなく一階層上の"/manifest.json"へ解決されてしまう
-    // （相対URL解決の標準挙動）。末尾スラッシュ付きへ301リダイレクトし、
-    // ブラウザのURLとその後の相対参照の基準を正しい場所に揃える。
-    return redirect(env, `${pathname}/${new URL(request.url).search}`);
-  }
-  if (key.includes('..')) return failure(env, 404, 'Not found.');
-  const object = await env.CONSOLE.get(key);
-  if (!object) return failure(env, 404, 'Not found.');
+// Workers Static Assets（設計§5）。ディレクトリ要求の末尾スラッシュ付与・index.html
+// 解決・パストラバーサル対策は、いずれもASSETS binding（プラットフォーム側の資産
+// ルーター）が担う——手製のR2キー解決だった旧serveStatic()のロジックはもう不要。
+// ここでの責務は、ASSETSの応答へ自前のセキュリティヘッダーを重ねて返すことだけ
+// （リダイレクト応答のlocationは保持する）。
+async function serveStatic(request: Request, env: Env): Promise<Response> {
+  const response = await env.ASSETS.fetch(request);
   const headers = securityHeaders(env, {
-    'content-type': object.httpMetadata?.contentType ?? 'application/octet-stream',
+    'content-type': response.headers.get('content-type') ?? 'application/octet-stream',
   });
-  return new Response(request.method === 'HEAD' ? null : object.body, { status: 200, headers });
+  const location = response.headers.get('location');
+  if (location) headers.set('location', location);
+  return new Response(response.body, { status: response.status, headers });
 }
 
 function failure(env: Env, status: number, message: string): Response {
@@ -912,7 +901,7 @@ export default {
       if (path.startsWith('/app/') || path.startsWith('/review/') || path === '/app' || path === '/review') {
         if (!await requireOwner(request, env)) return failure(env, 401, 'Owner authentication is required.');
       }
-      return await serveStatic(request, env, path);
+      return await serveStatic(request, env);
     } catch (error: any) {
       console.error(JSON.stringify({ level: 'error', message: error instanceof Error ? error.message : 'Unknown error' }));
       if (new URL(request.url).pathname.startsWith('/api/')) {

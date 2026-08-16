@@ -15,7 +15,6 @@ cloudflare:
   accountId: "0123456789abcdef0123456789abcdef"
   consoleDomain: console.example.com
   contentDomain: content.example.com
-  consoleBucket: html-share-console
   contentBucket: html-share-content
   publicKeyPath: .html-share/keys/public.pem
   privateKeyPath: .html-share/keys/private.pem

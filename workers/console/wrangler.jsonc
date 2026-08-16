@@ -11,8 +11,13 @@
     // 管理面ドメインに合わせて書き換える
     { "pattern": "html-share-console.example.com", "custom_domain": true }
   ],
+  // web/配下の静的資産（HTML/JS/CSS/アイコン）をWorkerへ同梱する（設計§5）。
+  // wrangler deployのたびに世代ごと原子的に入れ替わり、旧デプロイの資産は
+  // 切替後に不可達になる（プラットフォーム保証）。run_worker_firstにより
+  // 全リクエストが先にこのWorkerを通るため、/app/*・/review/*のAccess JWT検証は
+  // 引き続きWorker側で行い、通過後にのみASSETSへ委譲する（index.tsのserveStatic）。
+  "assets": { "directory": "../../web", "binding": "ASSETS", "run_worker_first": true },
   "r2_buckets": [
-    { "binding": "CONSOLE", "bucket_name": "html-share-console" },
     // publish lock/commit・世代GC・purgeがcontentバケットのオブジェクトを
     // list/delete/検証するために必要（CLIのS3 API書き込みとは別に、Worker側の
     // 管理操作専用）
