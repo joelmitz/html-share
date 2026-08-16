@@ -42,14 +42,42 @@ npx wrangler d1 migrations apply html-share-review --remote --config workers/con
 
 ## Cloudflare Access（管理面ログイン）の設定
 
-Zero Trust ダッシュボードで次を作成します。
+Zero Trust ダッシュボード（`dash.cloudflare.com` の左メニュー「Zero Trust」）で次を作成します。UIは頻繁に変わるため、メニュー名より「何をするか」を目印にしてください。
 
-1. **Access → Applications → Self-hosted** でアプリを作成し、管理面ドメインの `/app`・`/review`・`/api/owner` の3パスを対象にする
-2. ポリシーは「Allow / Include: Emails = 設定した `ownerEmail`」の1本だけにする（ログイン方法は One-time PIN で足りる）
-3. アプリの **Audience (AUD) タグ** をコピーし、`workers/console/wrangler.jsonc` の `ACCESS_AUD` へ設定する
-4. チームドメイン（`<team>.cloudflareaccess.com`）を `ACCESS_TEAM_DOMAIN` へ設定する
+1. **Access コントロール → アプリケーション → 新規アプリケーションを作成 → Self-hosted** でアプリを作成し、管理面ドメインの `/app`・`/review`・`/api/owner` の3パスを対象にする（「パブリックホスト名」を3回追加する）
+2. ポリシーは「Allow / Include: Emails = 設定した `ownerEmail`」の1本だけにする
+3. アプリの **Audience (AUD) タグ**（アプリ作成後、詳細タブに表示）をコピーし、`workers/console/wrangler.jsonc` の `ACCESS_AUD` へ設定する
+4. チームドメイン（`<team>.cloudflareaccess.com`。Zero Trust → 設定 → チーム名とドメイン に表示）を `ACCESS_TEAM_DOMAIN` へ設定する
 
 トップページ（`/`）と `/api/device/*`・`/api/pairings/*` はAccessの対象に含めません（端末はペアリングトークンで認証します）。
+
+### ログイン方法の追加（GitHub・Google・パスキー/セキュリティキー）
+
+デフォルトは One-time PIN（メールで届くコードでのログイン）だけです。他の方法を足す場合の導線は次のとおりです（2026年8月時点。「Settings → Authentication → Login methods」という旧UIの案内は現行版には存在しません）。
+
+**GitHub・Google などの外部IdPを追加する:**
+
+1. Zero Trust → **Access コントロール → 概要**（一覧の左メニュー最上部）を開く
+2. 「推奨事項」の **「アプリケーションのログイン方法を追加する」** をクリックすると、右側に「ID プロバイダーを統合する」パネルが開く
+   - 同じ画面へ直接行きたい場合は、左メニューの **インテグレーション → ID プロバイダー** から「+ ID プロバイダーを追加する」でも同じ一覧に入れる
+3. GitHub・Google それぞれの「追加」を押すと、**アプリ ID（Client ID）** と **クライアント シークレット（Client Secret）** の入力欄が出る
+4. 事前に外部サービス側でOAuthクライアントを作成し、コールバックURLを次の形式で登録しておく（`<team>` はチームドメインの1段目）:
+   ```
+   https://<team>.cloudflareaccess.com/cdn-cgi/access/callback
+   ```
+   - GitHub: `https://github.com/settings/developers` → **New OAuth App**
+   - Google: `https://console.cloud.google.com/apis/credentials` → **認証情報を作成 → OAuth クライアント ID**（種類: ウェブ アプリケーション）
+5. 取得した Client ID・Client Secret を3の画面へ入力して保存する
+6. 保護対象のアプリ（例: `share`）の編集画面 → **ログイン方法** タブを開き、「このアプリケーションで使用可能なIDプロバイダーを選択」へ追加したIdPを足して保存する（追加しただけではどのアプリにも反映されない）
+
+**パスキー/セキュリティキー（WebAuthn）を追加する:**
+
+これは独立したIdPではなく、**MFA（第2要素）の一種**として設定します。
+
+1. Zero Trust → **Access コントロール → Access 設定**
+2. 「多要素認証（MFA）を許可する」セクションの **生体認証**（パスキー相当）・**セキュリティキー**（物理キー相当）のトグルをONにする
+
+ここはアカウント全体の設定で、個々のAccessアプリケーション側でIdPのように選択する必要はありません。
 
 ## 署名鍵の作成とデプロイ
 
