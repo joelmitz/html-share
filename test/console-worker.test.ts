@@ -382,20 +382,24 @@ test('static console pages enforce the auth boundary', async () => {
   assert.equal(malformed.status, 404);
 });
 
-test('serves index.html for a directory path with no trailing slash', async () => {
+test('redirects a directory path with no trailing slash instead of serving it directly', async () => {
   // Access認証後のリダイレクトは元のリクエストパスへ戻るため、
   // "/app/index.html" ではなく末尾スラッシュ省略の "/app" で来ることがある。
+  // ここを直接配信するとブラウザ上のURLが"/app"のままになり、ページ内の
+  // 相対fetch（例: fetch('manifest.json')）が一階層上の"/manifest.json"へ
+  // 解決されてしまうため、末尾スラッシュ付きへ302リダイレクトする。
   const f = fixture();
   const noSlash = await consoleWorker.fetch(
     new Request(`${CONSOLE}/app`, { headers: { 'cf-access-jwt-assertion': ownerJwt() } }), f.env, f.context);
-  assert.equal(noSlash.status, 200);
-  assert.equal(await noSlash.text(), '<h1>App</h1>');
+  assert.equal(noSlash.status, 302);
+  assert.equal(noSlash.headers.get('location'), '/app/');
 
   const withSlash = await consoleWorker.fetch(
     new Request(`${CONSOLE}/app/`, { headers: { 'cf-access-jwt-assertion': ownerJwt() } }), f.env, f.context);
   assert.equal(withSlash.status, 200);
+  assert.equal(await withSlash.text(), '<h1>App</h1>');
 
-  // 拡張子を持つファイルパスは従来どおりそのまま解決される
+  // 拡張子を持つファイルパスは従来どおりそのまま解決される（リダイレクトしない）
   const asset = await consoleWorker.fetch(new Request(`${CONSOLE}/app/index.html`), f.env, f.context);
-  assert.equal(asset.status, 401); // JWTを付けていないので認証境界は健在（404ではない）
+  assert.equal(asset.status, 401); // JWTを付けていないので認証境界は健在（404でもリダイレクトでもない）
 });

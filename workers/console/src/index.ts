@@ -251,9 +251,14 @@ async function serveStatic(request: Request, env: Env, pathname: string): Promis
     key = `${key}index.html`;
   } else if (!(key.split('/').pop() ?? '').includes('.')) {
     // 拡張子の無い最終セグメント（例: "/app"）は末尾スラッシュ省略のディレクトリ
-    // 要求とみなし、index.html を補う。Access の認証後リダイレクトは元のリク
-    // エストパスへ戻すため、"/app/index.html" ではなく "/app" 単体で来ることがある。
-    key = `${key}/index.html`;
+    // 要求とみなす。Accessの認証後リダイレクトは元のリクエストパスへ戻すため、
+    // "/app/index.html" ではなく "/app" 単体で来ることがある。
+    // ここをその場でindex.htmlとして直接配信すると、ブラウザ上のURLは"/app"
+    // のままになり、ページ内の相対fetch（例: fetch('manifest.json')）が
+    // "/app/manifest.json" ではなく一階層上の"/manifest.json"へ解決されてしまう
+    // （相対URL解決の標準挙動）。末尾スラッシュ付きへ301リダイレクトし、
+    // ブラウザのURLとその後の相対参照の基準を正しい場所に揃える。
+    return redirect(env, `${pathname}/${new URL(request.url).search}`);
   }
   if (key.includes('..')) return failure(env, 404, 'Not found.');
   const object = await env.CONSOLE.get(key);
