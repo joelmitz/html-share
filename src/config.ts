@@ -10,6 +10,10 @@ export interface PageConfig {
   repository?: string;
   stream?: string;
   streamLabel?: string;
+  // 既定は'internal'（internal Worker、Cloudflare Access限定）。
+  // 外部共有したいページだけ'public'を明示する（opt-in。誤って個人的な
+  // 内容を外部共有してしまう事故を構造的に防ぐための既定値）
+  visibility?: 'public' | 'internal';
 }
 
 export interface HtmlShareConfig {
@@ -19,6 +23,9 @@ export interface HtmlShareConfig {
     consoleDomain: string;
     contentDomain: string;
     contentBucket: string;
+    // visibility='internal'なページ専用（internal Worker、Cloudflare Access限定）
+    internalDomain: string;
+    internalBucket: string;
     publicKeyPath: string;
     privateKeyPath: string;
   };
@@ -95,7 +102,11 @@ export function loadConfig(file?: string): HtmlShareConfig {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ownerEmail)) throw new Error('ownerEmail must be an email address');
   const consoleDomain = hostname(cloudflare.consoleDomain, 'cloudflare.consoleDomain');
   const contentDomain = hostname(cloudflare.contentDomain, 'cloudflare.contentDomain');
+  const internalDomain = hostname(cloudflare.internalDomain, 'cloudflare.internalDomain');
   if (consoleDomain === contentDomain) throw new Error('cloudflare.consoleDomain and cloudflare.contentDomain must be different security origins');
+  if (internalDomain === consoleDomain || internalDomain === contentDomain) {
+    throw new Error('cloudflare.internalDomain must be a different security origin from consoleDomain and contentDomain');
+  }
   const accountId = text(cloudflare.accountId, 'cloudflare.accountId').toLowerCase();
   if (!/^[0-9a-f]{32}$/.test(accountId)) {
     throw new Error('cloudflare.accountId must be a 32-character Cloudflare account ID');
@@ -108,6 +119,8 @@ export function loadConfig(file?: string): HtmlShareConfig {
       consoleDomain,
       contentDomain,
       contentBucket: text(cloudflare.contentBucket, 'cloudflare.contentBucket'),
+      internalDomain,
+      internalBucket: text(cloudflare.internalBucket, 'cloudflare.internalBucket'),
       publicKeyPath: text(cloudflare.publicKeyPath, 'cloudflare.publicKeyPath'),
       privateKeyPath: text(cloudflare.privateKeyPath, 'cloudflare.privateKeyPath'),
     },
@@ -122,6 +135,8 @@ export function loadConfig(file?: string): HtmlShareConfig {
           repository: typeof page.repository === 'string' ? page.repository.trim() : undefined,
           stream: typeof page.stream === 'string' ? page.stream.trim() : undefined,
           streamLabel: typeof page.streamLabel === 'string' ? page.streamLabel.trim() : undefined,
+          // 未指定・不正値はfail-closedで'internal'（外部共有はopt-inのみ）
+          visibility: page.visibility === 'public' ? 'public' : 'internal',
         };
       }),
       ownerLinkDays: positiveInteger(content.ownerLinkDays, 30, 'content.ownerLinkDays'),
@@ -134,7 +149,9 @@ export function loadConfig(file?: string): HtmlShareConfig {
   };
 }
 
-export function addPageToConfig(file: string | undefined, pagePath: string, title?: string): boolean {
+export function addPageToConfig(
+  file: string | undefined, pagePath: string, title?: string, visibility: 'public' | 'internal' = 'internal',
+): boolean {
   const configFile = configPath(file);
   const raw = parse(readFileSync(configFile, 'utf8')) as Record<string, any>;
   raw.content ??= {};
@@ -147,7 +164,10 @@ export function addPageToConfig(file: string | undefined, pagePath: string, titl
     (typeof item === 'string' ? item : (item as Record<string, unknown>)?.path) === storedPath,
   );
   if (exists) return false;
-  raw.content.pages.push(title ? { path: storedPath, title } : { path: storedPath });
+  // visibilityは常に明示的に書く（省略するとYAML上で既定値が読み取れず、
+  // 後からファイルだけ見て公開範囲を判断できなくなるため）
+  const entry: Record<string, unknown> = { path: storedPath, ...(title ? { title } : {}), visibility };
+  raw.content.pages.push(entry);
   writeFileSync(configFile, stringify(raw, { lineWidth: 120 }));
   return true;
 }
@@ -166,4 +186,8 @@ export function consoleUrl(config: HtmlShareConfig): string {
 
 export function contentUrl(config: HtmlShareConfig): string {
   return `https://${config.cloudflare.contentDomain}`;
+}
+
+export function internalUrl(config: HtmlShareConfig): string {
+  return `https://${config.cloudflare.internalDomain}`;
 }

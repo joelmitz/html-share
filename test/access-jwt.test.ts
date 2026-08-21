@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createSign, generateKeyPairSync, type KeyObject } from 'node:crypto';
 import test from 'node:test';
-import { resetAccessKeyCacheForTests, verifyAccessJwt } from '../workers/console/src/access.js';
+import { resetAccessKeyCacheForTests, verifyAccessJwt } from '../workers/shared/access.js';
 
 const CONFIG = {
   teamDomain: 'team.cloudflareaccess.com',

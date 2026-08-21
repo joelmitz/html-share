@@ -37,7 +37,7 @@ Usage:
   html-share build [--config file]
   html-share publish [--config file]
   html-share share <slug> [--days 7]
-  html-share page add <path> [--title title]
+  html-share page add <path> [--title title] [--public]
   html-share keys init [--overwrite]
   html-share keys store [--overwrite]
   html-share review pair <code> [--name name]
@@ -63,8 +63,11 @@ async function main(): Promise<void> {
     const action = process.argv[3];
     const pagePath = process.argv[4];
     if (action !== 'add' || !pagePath) usage();
-    const added = addPageToConfig(option('--config'), pagePath, option('--title'));
-    console.log(JSON.stringify({ ok: true, added, path: pagePath }));
+    // 既定は'internal'（internal Worker限定）。外部共有したいときだけ
+    // --publicを明示する（誤って個人的な内容を外部共有してしまう事故を防ぐ既定値）
+    const visibility = flag('--public') ? 'public' : 'internal';
+    const added = addPageToConfig(option('--config'), pagePath, option('--title'), visibility);
+    console.log(JSON.stringify({ ok: true, added, path: pagePath, visibility }));
     return;
   }
 

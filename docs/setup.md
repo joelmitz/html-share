@@ -6,8 +6,8 @@ HTML共有くん（Cloudflare版）は、自分のCloudflareアカウントへ�
 
 - Node.js 22以降
 - Cloudflareアカウントと、そこに追加済みのゾーン（ドメイン）
-- そのゾーン配下の2つのホスト名（管理面・閲覧面。別オリジンにする）
-- Cloudflare Zero Trust（無料プランで可。管理面のログインに使う）
+- そのゾーン配下の3つのホスト名（管理面・閲覧面・Access限定閲覧面。すべて別オリジンにする）
+- Cloudflare Zero Trust（無料プランで可。管理面とAccess限定閲覧面のログインに使う）
 - Claude CodeまたはCodex
 
 証明書の発行は不要です（Cloudflareのカスタムドメインで自動発行されます）。
@@ -30,10 +30,11 @@ cp html-share.config.example.yaml html-share.config.yaml
 ```bash
 npx wrangler login
 npx wrangler r2 bucket create html-share-content
+npx wrangler r2 bucket create html-share-internal
 npx wrangler d1 create html-share-review
 ```
 
-**先に** `wrangler d1 create` が出力した `database_id` を `workers/console/wrangler.jsonc` へ書き込みます（placeholder のままだと次の migration が失敗します）。あわせて両方の `workers/*/wrangler.jsonc` の `routes` と `vars`（ドメイン・オーナーメール等）を自分の値へ書き換えます。そのうえで migration を適用します。
+**先に** `wrangler d1 create` が出力した `database_id` を `workers/console/wrangler.jsonc` へ書き込みます（placeholder のままだと次の migration が失敗します）。あわせて `workers/content` `workers/internal` `workers/console` の3つ全ての `wrangler.jsonc` の `routes` と `vars`（ドメイン・オーナーメール等）を自分の値へ書き換えます。そのうえで migration を適用します。
 
 ```bash
 npx wrangler d1 migrations apply html-share-review --remote --config workers/console/wrangler.jsonc
@@ -49,6 +50,17 @@ Zero Trust ダッシュボード（`dash.cloudflare.com` の左メニュー「Ze
 4. チームドメイン（`<team>.cloudflareaccess.com`。Zero Trust → 設定 → チーム名とドメイン に表示）を `ACCESS_TEAM_DOMAIN` へ設定する
 
 トップページ（`/`）と `/api/device/*`・`/api/pairings/*` はAccessの対象に含めません（端末はペアリングトークンで認証します）。
+
+## Cloudflare Access（Access限定閲覧面ログイン）の設定
+
+`visibility: internal`（既定値）で publish したページを見るための、管理面とは別のAccessアプリを作ります。上と同じ手順で、対象ドメインと書き込み先だけが異なります。
+
+1. **Access コントロール → アプリケーション → 新規アプリケーションを作成 → Self-hosted** でアプリを作成し、Access限定閲覧面ドメイン全体（パス指定なし）を対象にする
+2. ポリシーは管理面と同じく「Allow / Include: Emails = 設定した `ownerEmail`」の1本だけにする
+3. アプリの **Audience (AUD) タグ** をコピーし、`workers/internal/wrangler.jsonc` の `ACCESS_AUD` へ設定する
+4. `ACCESS_TEAM_DOMAIN` は管理面アプリと同じチームドメインを使う
+
+管理面アプリとAccess限定閲覧面アプリは、**それぞれ別のAUDを持つ別々のAccessアプリケーション**にします（1つのAUDを使い回さない。`workers/internal/src/index.ts` は `workers/console/src/index.ts` と独立にJWTを検証するため、AUDを混同すると誤って通す/誤って拒否するどちらの事故にもつながります）。
 
 ### ログイン方法の追加（GitHub・Google・パスキー/セキュリティキー）
 
@@ -82,13 +94,15 @@ Zero Trust ダッシュボード（`dash.cloudflare.com` の左メニュー「Ze
 
 ```bash
 html-share keys init
-npm run deploy        # content → console の順に2つのWorkerをデプロイ
+npm run deploy        # content → internal → console の順に3つのWorkerをデプロイ
 html-share keys store # 署名鍵を wrangler secret として登録
 ```
 
+`npm run deploy`（内部で呼ぶ各`deploy:*`）は、`routes`・`vars`が`example.com`のままだったり`ACCESS_AUD`が空のままだったりすると、実際にWorkerへ反映する前に失敗します（`scripts/check-wrangler-config.mjs`。書き換え忘れたまま「成功」扱いになるのを防ぐための機械的な検査）。
+
 ## アップロード用R2 APIトークン
 
-CLIの `publish` はcontentバケットへR2のS3互換APIで直接アップロードします（console資産＝`web/`配下はWorkers Static Assetsとして`wrangler deploy`が配布するため、バケットもCLIアップロードも不要です）。ダッシュボードの **R2 → Manage API Tokens** で contentバケットへの **Object Write** トークン（Read/List/Deleteは不要）を発行し、環境変数に設定します。
+CLIの `publish` はcontent・internal両バケットへR2のS3互換APIで直接アップロードします（`visibility`ごとにどちらへ送るか決まります。console資産＝`web/`配下はWorkers Static Assetsとして`wrangler deploy`が配布するため、バケットもCLIアップロードも不要です）。ダッシュボードの **R2 → Manage API Tokens** で **両方のバケット**（または全バケット）への **Object Write** トークン（Read/List/Deleteは不要）を発行し、環境変数に設定します。
 
 `publish` はこのマシンがペアリング済みであることも前提とします（`html-share review pair <code>`。ペアリングコードはオーナーコンソールで発行します）。ページの実体は `pages/<このマシンのdeviceId>/<世代>/<slug>/index.html` として世代ごとに分離され、共有中のURLをpublishが壊すことはありません。
 

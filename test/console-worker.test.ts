@@ -3,7 +3,7 @@ import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
 import test from 'node:test';
 import consoleWorker, { purgeDeviceObjects } from '../workers/console/src/index.js';
 import contentWorker from '../workers/content/src/index.js';
-import { resetAccessKeyCacheForTests } from '../workers/console/src/access.js';
+import { resetAccessKeyCacheForTests } from '../workers/shared/access.js';
 import { AssetsStub, D1Stub, R2Stub, executionContextStub } from './helpers/d1-stub.ts';
 
 const CONSOLE = 'https://console.example.com';
@@ -34,11 +34,14 @@ function ownerJwt(email = OWNER_EMAIL): string {
   return `${header}.${payload}.${signature}`;
 }
 
+const INTERNAL_ORIGIN = 'https://internal.example.com';
+
 interface Fixture {
   env: any;
   db: D1Stub;
   assets: AssetsStub;
   contentBucket: R2Stub;
+  internalBucket: R2Stub;
   context: ExecutionContext;
 }
 
@@ -51,14 +54,17 @@ function fixture(overrides: Record<string, string> = {}): Fixture {
   assets.put('/', { body: '<h1>Landing</h1>', contentType: 'text/html; charset=utf-8' });
   assets.put('/app/index.html', { body: '<h1>App</h1>', contentType: 'text/html; charset=utf-8' });
   const contentBucket = new R2Stub();
+  const internalBucket = new R2Stub();
   const env = {
     DB: db,
     ASSETS: assets,
     CONTENT: contentBucket,
+    INTERNAL: internalBucket,
     SIGNING_PRIVATE_KEY: signing.privateKey,
     OWNER_EMAIL,
     CONSOLE_ORIGIN: CONSOLE,
     CONTENT_ORIGIN: CONTENT,
+    INTERNAL_ORIGIN,
     MAXIMUM_SHARE_DAYS: '30',
     OWNER_LINK_DAYS: '30',
     ALLOWED_INTERNAL_CIDRS: '["203.0.113.0/24"]',
@@ -66,15 +72,21 @@ function fixture(overrides: Record<string, string> = {}): Fixture {
     ACCESS_AUD: AUD,
     ...overrides,
   };
-  return { env, db, assets, contentBucket, context: executionContextStub() };
+  return { env, db, assets, contentBucket, internalBucket, context: executionContextStub() };
 }
 
 // pages/publish系テスト共通のヘルパー。deviceToken保持者として
 // lock→R2直接put（テストなのでS3 API相当を素通り）→commitまで一気に進める。
 async function publishPage(
   f: Fixture, deviceToken: string, slug: string, html: string,
-  fields: Partial<{ title: string; source: string; repository: string; stream: string; streamLabel: string; date: string; updatedAt: string }> = {},
+  fields: Partial<{
+    title: string; source: string; repository: string; stream: string; streamLabel: string;
+    date: string; updatedAt: string; visibility: 'public' | 'internal';
+  }> = {},
 ): Promise<{ gen: string; objectKey: string; deviceId: string }> {
+  // 既存テストの大半はpublic共有（content Worker経由）を検証しているため、
+  // このヘルパーの既定は'public'のまま維持する（サーバー側の既定'internal'とは別軸）。
+  const visibility = fields.visibility ?? 'public';
   const lockRes = await consoleWorker.fetch(
     new Request(`${CONSOLE}/api/device/publish/lock`, {
       method: 'POST', headers: { 'x-review-device-token': deviceToken },
@@ -85,7 +97,8 @@ async function publishPage(
     'SELECT device_id FROM publish_locks WHERE token = ?1',
   ).get(lockToken) as any).device_id as string;
   const objectKey = `pages/${deviceId}/${gen}/${slug}/index.html`;
-  f.contentBucket.put(objectKey, { body: html, contentType: 'text/html; charset=utf-8' });
+  const bucket = visibility === 'public' ? f.contentBucket : f.internalBucket;
+  bucket.put(objectKey, { body: html, contentType: 'text/html; charset=utf-8' });
   const md5 = createHash('md5').update(html).digest('hex');
   const commitRes = await consoleWorker.fetch(
     new Request(`${CONSOLE}/api/device/publish/commit`, {
@@ -103,6 +116,7 @@ async function publishPage(
           updatedAt: fields.updatedAt ?? '2026-08-16T00:00:00.000Z',
           bytes: Buffer.byteLength(html),
           md5,
+          visibility,
         }],
       }),
     }), f.env, f.context);
@@ -434,6 +448,62 @@ test('preferences round-trip through D1', async () => {
   assert.deepEqual(body.readMarks, { 'repo-a': { v: null, at: '2026-08-15T01:00:00.000Z' } });
 });
 
+test('visibility=internal pages upload to INTERNAL, not CONTENT, and get a plain INTERNAL_ORIGIN href', async () => {
+  const f = fixture();
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { objectKey } = await publishPage(f, token, 'private-notes', '<h1>Private</h1>', { visibility: 'internal' });
+
+  // CONTENTバケットには一切書き込まれていない（publishPageがinternalBucketへputしている）
+  assert.equal((await f.contentBucket.get(objectKey)), null);
+  assert.notEqual((await f.internalBucket.get(objectKey)), null);
+
+  const owner = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/pages`, { headers: ownerHeaders() }), f.env, f.context);
+  const page = (await owner.json() as any).pages.find((item: any) => item.slug === 'private-notes');
+  assert.equal(page.visibility, 'internal');
+  // internal側のhrefは署名なしの平文URL（Accessが本人確認そのものを行うため）
+  assert.equal(page.href, `${INTERNAL_ORIGIN}/${objectKey}`);
+});
+
+test('handleShare refuses to share a visibility=internal page', async () => {
+  const f = fixture();
+  const token = await claimDevice(f, await createPairingCode(f));
+  const { deviceId } = await publishPage(f, token, 'private-notes', '<h1>Private</h1>', { visibility: 'internal' });
+
+  const ownerAttempt = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/shares`, {
+      method: 'POST', headers: ownerHeaders(),
+      body: JSON.stringify({ deviceId, slug: 'private-notes', scope: 'public', days: 7 }),
+    }), f.env, f.context);
+  assert.equal(ownerAttempt.status, 400);
+
+  const deviceAttempt = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/device/shares`, {
+      method: 'POST', headers: { 'x-review-device-token': token },
+      body: JSON.stringify({ slug: 'private-notes', scope: 'public', days: 7 }),
+    }), f.env, f.context);
+  assert.equal(deviceAttempt.status, 400);
+});
+
+test('owner device purge sweeps both CONTENT and INTERNAL objects', async () => {
+  const f = fixture();
+  const token = await claimDevice(f, await createPairingCode(f), 'Mixed Visibility PC');
+  const { deviceId, objectKey: publicKey } = await publishPage(f, token, 'public-page', '<h1>Public</h1>', { visibility: 'public' });
+  // 同じdeviceでの2回目のpublishは1回目の世代をstaleにする（別genのオブジェクトとして
+  // 両バケットに残る）ため、purgeが本当に両方から掃除するかを見るのに都合がよい
+  const { objectKey: internalKey } = await publishPage(f, token, 'internal-page', '<h1>Internal</h1>', { visibility: 'internal' });
+
+  const purged = await consoleWorker.fetch(
+    new Request(`${CONSOLE}/api/owner/devices/${deviceId}/purge`, { method: 'POST', headers: ownerHeaders() }),
+    f.env, f.context);
+  assert.equal(purged.status, 200);
+  assert.deepEqual(await purged.json(), { done: true });
+
+  assert.equal(await f.contentBucket.get(publicKey), null);
+  assert.equal(await f.internalBucket.get(internalKey), null);
+  assert.equal((f.db.database.prepare('SELECT COUNT(*) AS c FROM pages WHERE device_id = ?1').get(deviceId) as any).c, 0);
+});
+
 test('owner share URLs interoperate with the content worker', async () => {
   const f = fixture();
   const token = await claimDevice(f, await createPairingCode(f));
@@ -633,7 +703,7 @@ test('publish lock: concurrent second lock is rejected, renew extends TTL, relea
       method: 'POST', headers,
       body: JSON.stringify({
         lockToken,
-        pages: [{ slug: 'demo', title: 'demo', source: 's', repository: 'r', stream: 'main', streamLabel: 'main', date: '2026-08-16', updatedAt: '2026-08-16T00:00:00.000Z', bytes: Buffer.byteLength(html), md5: createHash('md5').update(html).digest('hex') }],
+        pages: [{ slug: 'demo', title: 'demo', source: 's', repository: 'r', stream: 'main', streamLabel: 'main', date: '2026-08-16', updatedAt: '2026-08-16T00:00:00.000Z', bytes: Buffer.byteLength(html), md5: createHash('md5').update(html).digest('hex'), visibility: 'public' }],
       }),
     }), f.env, f.context);
   assert.equal(committed.status, 200);
@@ -671,7 +741,7 @@ test('commit verification rejects missing/size/md5-mismatched uploads without to
   const page = (overrides: Record<string, unknown>) => ({
     slug: 'demo', title: 'demo', source: 'https://example.com/repo', repository: 'repo',
     stream: 'main', streamLabel: 'main', date: '2026-08-16', updatedAt: '2026-08-16T00:00:00.000Z',
-    bytes: 5, md5: createHash('md5').update('<h1>').digest('hex'), ...overrides,
+    bytes: 5, md5: createHash('md5').update('<h1>').digest('hex'), visibility: 'public', ...overrides,
   });
   const pagesCount = () => (f.db.database.prepare('SELECT COUNT(*) AS c FROM pages').get() as any).c;
 
@@ -756,7 +826,7 @@ test('purge: lock conflict, purging blocks new publish locks, idempotent re-run,
       method: 'POST', headers: { 'x-review-device-token': token },
       body: JSON.stringify({
         lockToken: heldLockToken,
-        pages: [{ slug: 'demo', title: 'demo', source: 's', repository: 'r', stream: 'main', streamLabel: 'main', date: '2026-08-16', updatedAt: '2026-08-16T00:00:00.000Z', bytes: Buffer.byteLength(html), md5: createHash('md5').update(html).digest('hex') }],
+        pages: [{ slug: 'demo', title: 'demo', source: 's', repository: 'r', stream: 'main', streamLabel: 'main', date: '2026-08-16', updatedAt: '2026-08-16T00:00:00.000Z', bytes: Buffer.byteLength(html), md5: createHash('md5').update(html).digest('hex'), visibility: 'public' }],
       }),
     }), f.env, f.context);
 
@@ -856,7 +926,7 @@ test('purge lease renewal re-reads the clock on every batch instead of reusing a
 
   const clockValues = [1_700_000_000, 1_700_002_000]; // 2つ目は1つ目より2000秒進んでいる
   let calls = 0;
-  const result = await purgeDeviceObjects(f.env, deviceId, lockToken, () => clockValues[calls++] ?? clockValues[clockValues.length - 1]);
+  const result = await purgeDeviceObjects(f.env, f.env.CONTENT, deviceId, lockToken, () => clockValues[calls++] ?? clockValues[clockValues.length - 1]);
   assert.equal(calls, 2); // 2バッチ分、毎回nowFnを呼び直している
   assert.equal(result.done, true);
 
@@ -897,7 +967,7 @@ test('purge renews the lease before deleting each batch, and never deletes when 
     f.db.database.prepare('UPDATE publish_locks SET token = ?1 WHERE device_id = ?2').run('stolen-token', deviceId);
     return 1_700_000_000;
   };
-  const result = await purgeDeviceObjects(f.env, deviceId, lockToken, nowFn);
+  const result = await purgeDeviceObjects(f.env, f.env.CONTENT, deviceId, lockToken, nowFn);
   assert.equal(renewCalls, 1);
   assert.equal(deleteCalls, 0); // renew失敗時はdeleteが一切呼ばれない
   assert.equal(result.done, false);
@@ -956,7 +1026,7 @@ test('GET /api/owner/pages returns the manifest-shaped contract with deviceId/de
   assert.equal(body.pages[1].slug, 'older');
   assert.deepEqual(Object.keys(body.pages[0]).sort(), [
     'date', 'deviceId', 'deviceName', 'href', 'objectKey',
-    'repository', 'slug', 'source', 'stream', 'streamLabel', 'title', 'updatedAt',
+    'repository', 'slug', 'source', 'stream', 'streamLabel', 'title', 'updatedAt', 'visibility',
   ].sort());
   assert.equal(body.pages[0].deviceName, 'Device B');
   const parsedHref = new URL(body.pages[0].href);

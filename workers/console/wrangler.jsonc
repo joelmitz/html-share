@@ -21,7 +21,10 @@
     // publish lock/commit・世代GC・purgeがcontentバケットのオブジェクトを
     // list/delete/検証するために必要（CLIのS3 API書き込みとは別に、Worker側の
     // 管理操作専用）
-    { "binding": "CONTENT", "bucket_name": "html-share-content" }
+    { "binding": "CONTENT", "bucket_name": "html-share-content" },
+    // visibility='internal'なページの世代GC・purge検証用（internal Worker新設）。
+    // 実際のオブジェクト配信はinternal Worker（別デプロイ）が行う
+    { "binding": "INTERNAL", "bucket_name": "html-share-internal" }
   ],
   "d1_databases": [
     // database_id は `wrangler d1 create html-share-review` の出力で書き換える
@@ -32,6 +35,8 @@
     "OWNER_EMAIL": "owner@example.com",
     "CONSOLE_ORIGIN": "https://html-share-console.example.com",
     "CONTENT_ORIGIN": "https://html-share-content.example.com",
+    // visibility='internal'なページのオーナーリンクが指す先（internal Workerのドメイン）
+    "INTERNAL_ORIGIN": "https://html-share-internal.example.com",
     "MAXIMUM_SHARE_DAYS": "30",
     // GET /api/owner/pages が本人用リンクをその場で署名する際の有効期間。
     // 表示のたびに再署名されるため、実質は「開いたタブを放置できる期間」

@@ -45,9 +45,10 @@
     "audit:prod": "npm audit --omit=dev --audit-level=high",
     "verify": "npm run check && npm test && npm run test:workers && npm run validate:skill && npm run validate:plugin && npm run security:scan && npm run audit:prod",
     "preview": "node scripts/preview.mjs .html-share/build/console",
-    "deploy:content": "wrangler deploy --config workers/content/wrangler.jsonc",
-    "deploy:console": "wrangler deploy --config workers/console/wrangler.jsonc",
-    "deploy": "npm run deploy:content && npm run deploy:console"
+    "deploy:content": "node scripts/check-wrangler-config.mjs workers/content/wrangler.jsonc && wrangler deploy --config workers/content/wrangler.jsonc",
+    "deploy:internal": "node scripts/check-wrangler-config.mjs workers/internal/wrangler.jsonc && wrangler deploy --config workers/internal/wrangler.jsonc",
+    "deploy:console": "node scripts/check-wrangler-config.mjs workers/console/wrangler.jsonc && wrangler deploy --config workers/console/wrangler.jsonc",
+    "deploy": "npm run deploy:content && npm run deploy:internal && npm run deploy:console"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1109.0",

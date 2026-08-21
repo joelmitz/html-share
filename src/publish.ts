@@ -57,8 +57,12 @@ export async function publish(config: HtmlShareConfig): Promise<{ consoleUrl: st
     // 実際のキーではない。R2キーはdeviceId/genを注入してこの場で導出する（§4.1）。
     const body = readFileSync(path.join(buildRoot, 'content', page.objectKey));
     const objectKey = `pages/${deviceId}/${lock.gen}/${page.slug}/index.html`;
+    // visibility='public'→CONTENT（誰でも署名URLで閲覧可）、'internal'→INTERNAL
+    // （Cloudflare Access限定）。同じR2アカウント資格情報が両バケットへ書き込める
+    // ことを確認済み（バケット単位スコープではなくアカウント単位スコープのトークン）
+    const bucket = page.visibility === 'public' ? config.cloudflare.contentBucket : config.cloudflare.internalBucket;
     await client.send(new PutObjectCommand({
-      Bucket: config.cloudflare.contentBucket,
+      Bucket: bucket,
       Key: objectKey,
       Body: body,
       ContentType: 'text/html; charset=utf-8',
@@ -77,6 +81,7 @@ export async function publish(config: HtmlShareConfig): Promise<{ consoleUrl: st
       updatedAt: page.updatedAt,
       bytes: body.byteLength,
       md5: createHash('md5').update(body).digest('hex'),
+      visibility: page.visibility,
     });
   }
 

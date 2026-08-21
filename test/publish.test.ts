@@ -24,6 +24,8 @@ cloudflare:
   consoleDomain: ${CONSOLE_DOMAIN}
   contentDomain: content.example.com
   contentBucket: html-share-content
+  internalDomain: internal.example.com
+  internalBucket: html-share-internal
   publicKeyPath: keys/public.pem
   privateKeyPath: keys/private.pem
 content:
@@ -143,7 +145,9 @@ test('share rejects a duration above the configured maximum without contacting t
 
 // publish() 本体のテスト。build→lock→(S3への直接PUT)→commit の一連を、fetch(Worker API)と
 // S3Client.prototype.send(R2アップロード)の両方をモックして検証する。
-function publishFixture(): { config: ReturnType<typeof loadConfig>; credentialsPath: string; deviceToken: string } {
+function publishFixture(
+  visibility: 'public' | 'internal' = 'public',
+): { config: ReturnType<typeof loadConfig>; credentialsPath: string; deviceToken: string } {
   const root = mkdtempSync(path.join(tmpdir(), 'html-share-publish-flow-'));
   mkdirSync(path.join(root, 'pages'));
   writeFileSync(path.join(root, 'pages', 'demo.html'), '<!doctype html><title>Demo</title><h1>Demo</h1>');
@@ -154,6 +158,8 @@ cloudflare:
   consoleDomain: ${CONSOLE_DOMAIN}
   contentDomain: content.example.com
   contentBucket: html-share-content
+  internalDomain: internal.example.com
+  internalBucket: html-share-internal
   publicKeyPath: keys/public.pem
   privateKeyPath: keys/private.pem
 content:
@@ -161,6 +167,7 @@ content:
   pages:
     - path: pages/demo.html
       slug: demo
+      visibility: ${visibility}
 `);
   const config = loadConfig(configFile);
   const credentialsPath = path.join(root, 'review-device.json');
@@ -227,6 +234,46 @@ test('publish acquires a lock, uploads each page to the deviceId/gen-prefixed R2
     assert.equal(committedPage.slug, 'demo');
     assert.equal(committedPage.bytes, s3Calls[0].Body.length);
     assert.equal(committedPage.md5, createHash('md5').update(s3Calls[0].Body as Buffer).digest('hex'));
+    assert.equal(committedPage.visibility, 'public');
+  } finally {
+    globalThis.fetch = originalFetch;
+    S3Client.prototype.send = originalSend;
+    delete process.env.HTML_SHARE_CREDENTIALS;
+    delete process.env.R2_ACCESS_KEY_ID;
+    delete process.env.R2_SECRET_ACCESS_KEY;
+  }
+});
+
+test('publish uploads a visibility=internal page to the internal bucket, not content', async () => {
+  const { config, credentialsPath, deviceToken } = publishFixture('internal');
+  process.env.HTML_SHARE_CREDENTIALS = credentialsPath;
+  process.env.R2_ACCESS_KEY_ID = 'test-key';
+  process.env.R2_SECRET_ACCESS_KEY = 'test-secret';
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    if (url.pathname === '/api/device/publish/lock') {
+      return new Response(JSON.stringify({ token: 'lock-token', gen: '1700000000-deadbeefcafebabe', expiresAt: 1700001800 }), { status: 200 });
+    }
+    if (url.pathname === '/api/device/publish/commit') {
+      return new Response(JSON.stringify({ ok: true, pages: body.pages.length, gcDeleted: 0 }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ error: 'unexpected request' }), { status: 404 });
+  }) as typeof fetch;
+
+  const s3Calls: Array<{ Bucket: string }> = [];
+  const originalSend = S3Client.prototype.send;
+  (S3Client.prototype as any).send = async function send(command: any) {
+    s3Calls.push({ ...command.input });
+    return {};
+  };
+
+  try {
+    await publish(config);
+    assert.equal(s3Calls.length, 1);
+    assert.equal(s3Calls[0].Bucket, 'html-share-internal');
   } finally {
     globalThis.fetch = originalFetch;
     S3Client.prototype.send = originalSend;

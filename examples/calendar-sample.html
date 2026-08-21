@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f8fc">
+  <title>2026年8月のスケジュール（サンプル）</title>
+  <style>
+    body { margin: 0; padding: 2rem 1.25rem; background: #f5f8fc; color: #10233f; font-family: system-ui, sans-serif; }
+    main { width: min(52rem, 100%); margin: auto; }
+    h1 { font-size: clamp(1.6rem, 6vw, 2.1rem); line-height: 1.3; text-wrap: balance; margin-bottom: .25rem; }
+    .lead { color: #4a5a72; margin-bottom: 1.5rem; }
+
+    /* 月間カレンダー: 7列グリッド（月曜始まり） */
+    .cal-grid {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 1px;
+      background: #dce6f1;
+      border: 1px solid #dce6f1;
+      border-radius: .75rem;
+      overflow: hidden;
+    }
+    .dow {
+      background: #eaf1f9;
+      color: #4a5a72;
+      font-size: .8rem;
+      font-weight: 700;
+      text-align: center;
+      padding: .5rem 0;
+    }
+    .day {
+      background: white;
+      min-height: 6rem;
+      padding: .4rem;
+      display: flex;
+      flex-direction: column;
+      gap: .3rem;
+    }
+    .day.pad { background: #f7fafc; }
+    .dn { font-size: .8rem; font-weight: 700; color: #10233f; }
+    .dn i { font-style: normal; font-size: .7rem; color: #8194ab; margin-left: .2rem; }
+    .day.pad .dn { color: #b7c3d3; }
+    .chip {
+      background: #eaf1f9;
+      color: #10233f;
+      font-size: .72rem;
+      line-height: 1.3;
+      padding: .3rem .45rem;
+      border-radius: .4rem;
+      border-left: 3px solid #2f6fed;
+    }
+    .chip.holiday { background: #fdeeee; border-left-color: #d5453d; }
+
+    footer { margin-top: 1.5rem; color: #8194ab; font-size: .8rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>2026年8月のスケジュール（サンプル）</h1>
+    <p class="lead">HTML共有くんの「月間カレンダー」レイアウトのサンプルです。ブラウザ幅を736px以下（またはスマホ）にすると、予定のある日だけの縦リストに自動で畳まれます。</p>
+
+    <div class="cal-grid">
+      <div class="dow">月</div><div class="dow">火</div><div class="dow">水</div><div class="dow">木</div><div class="dow">金</div><div class="dow">土</div><div class="dow">日</div>
+
+      <div class="day pad"><div class="dn">27<i>月</i></div></div>
+      <div class="day pad"><div class="dn">28<i>火</i></div></div>
+      <div class="day pad"><div class="dn">29<i>水</i></div></div>
+      <div class="day pad"><div class="dn">30<i>木</i></div></div>
+      <div class="day pad"><div class="dn">31<i>金</i></div></div>
+      <div class="day"><div class="dn">1<i>土</i></div></div>
+      <div class="day"><div class="dn">2<i>日</i></div></div>
+
+      <div class="day has">
+        <div class="dn">3<i>月</i></div>
+        <div class="chip">週次定例</div>
+        <div class="chip">D1計装レビュー提出</div>
+      </div>
+      <div class="day"><div class="dn">4<i>火</i></div></div>
+      <div class="day"><div class="dn">5<i>水</i></div></div>
+      <div class="day"><div class="dn">6<i>木</i></div></div>
+      <div class="day"><div class="dn">7<i>金</i></div></div>
+      <div class="day"><div class="dn">8<i>土</i></div></div>
+      <div class="day"><div class="dn">9<i>日</i></div></div>
+
+      <div class="day"><div class="dn">10<i>月</i></div></div>
+      <div class="day"><div class="dn">11<i>火</i></div></div>
+      <div class="day has"><div class="dn">12<i>水</i></div><div class="chip">四半期振り返り</div></div>
+      <div class="day"><div class="dn">13<i>木</i></div></div>
+      <div class="day"><div class="dn">14<i>金</i></div></div>
+      <div class="day has"><div class="dn">15<i>土</i></div><div class="chip holiday">終戦の日</div></div>
+      <div class="day"><div class="dn">16<i>日</i></div></div>
+
+      <div class="day"><div class="dn">17<i>月</i></div></div>
+      <div class="day"><div class="dn">18<i>火</i></div></div>
+      <div class="day"><div class="dn">19<i>水</i></div></div>
+      <div class="day"><div class="dn">20<i>木</i></div></div>
+      <div class="day has">
+        <div class="dn">21<i>金</i></div>
+        <div class="chip">共有くん UI改善デプロイ</div>
+        <div class="chip">agmsg thread不整合の確認</div>
+      </div>
+      <div class="day"><div class="dn">22<i>土</i></div></div>
+      <div class="day"><div class="dn">23<i>日</i></div></div>
+
+      <div class="day"><div class="dn">24<i>月</i></div></div>
+      <div class="day"><div class="dn">25<i>火</i></div></div>
+      <div class="day has"><div class="dn">26<i>水</i></div><div class="chip">Issue #120 効果測定</div></div>
+      <div class="day"><div class="dn">27<i>木</i></div></div>
+      <div class="day"><div class="dn">28<i>金</i></div></div>
+      <div class="day"><div class="dn">29<i>土</i></div></div>
+      <div class="day"><div class="dn">30<i>日</i></div></div>
+
+      <div class="day has"><div class="dn">31<i>月</i></div><div class="chip">月次レビュー</div></div>
+      <div class="day pad"><div class="dn">1<i>火</i></div></div>
+      <div class="day pad"><div class="dn">2<i>水</i></div></div>
+      <div class="day pad"><div class="dn">3<i>木</i></div></div>
+      <div class="day pad"><div class="dn">4<i>金</i></div></div>
+      <div class="day pad"><div class="dn">5<i>土</i></div></div>
+      <div class="day pad"><div class="dn">6<i>日</i></div></div>
+    </div>
+
+    <footer>これはHTML共有くんに同梱された架空のサンプルです。予定はすべてダミーです。</footer>
+  </main>
+</body>
+</html>

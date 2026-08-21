@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "html-share-internal",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  // workers.dev と preview URL を無効にし、カスタムドメイン経由のみで公開する
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "routes": [
+    // internal閲覧面ドメインに合わせて書き換える
+    { "pattern": "html-share-internal.example.com", "custom_domain": true }
+  ],
+  "r2_buckets": [
+    { "binding": "INTERNAL", "bucket_name": "html-share-internal" }
+  ],
+  "vars": {
+    // 管理面オリジン（frame-ancestors 用）。書き換える
+    "CONSOLE_ORIGIN": "https://html-share-console.example.com",
+    "OWNER_EMAIL": "owner@example.com",
+    // Zero Trust のチーム名（<team>.cloudflareaccess.com）と、
+    // share-internal専用に新設したAccessアプリのAUDタグ。書き換える
+    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
+    "ACCESS_AUD": ""
+  }
+}

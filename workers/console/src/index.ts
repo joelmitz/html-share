@@ -1,4 +1,4 @@
-import { verifyAccessJwt } from './access.js';
+import { verifyAccessJwt } from '../../shared/access.js';
 import { cleanReadMarks } from './read-marks.js';
 
 export interface Env {
@@ -8,10 +8,17 @@ export interface Env {
   // 移行手順§5.1のPhase A検証ゲート(d)）。
   ASSETS: Fetcher;
   CONTENT: R2Bucket;
+  // visibility='internal'なページ専用バケット（internal Worker新設）。
+  // 実オブジェクトの配信はinternal Worker（別デプロイ）が行い、この
+  // Workerからはlock/commit検証・世代GC・purgeでのみ触る（CONTENTと同じ扱い）
+  INTERNAL: R2Bucket;
   SIGNING_PRIVATE_KEY: string;
   OWNER_EMAIL: string;
   CONSOLE_ORIGIN: string;
   CONTENT_ORIGIN: string;
+  // internal Workerのオリジン。オーナーリンク（GET /api/owner/pages）が
+  // visibility='internal'なページのhrefを組み立てる際に使う
+  INTERNAL_ORIGIN: string;
   MAXIMUM_SHARE_DAYS: string;
   OWNER_LINK_DAYS: string;
   ALLOWED_INTERNAL_CIDRS: string;
@@ -177,6 +184,16 @@ function pageObjectKey(deviceId: string, gen: string, slug: string): string {
   return `pages/${deviceId}/${gen}/${slug}/index.html`;
 }
 
+type Visibility = 'public' | 'internal';
+
+// visibility='public'はCONTENT（content Worker、署名URLなら誰でも閲覧可）、
+// 'internal'はINTERNAL（internal Worker、Cloudflare Access限定）。
+// CLI側のconfig.content.pages[].visibilityがそのまま伝播する——サーバー側で
+// 「このslugは公開してよいか」を判断する材料は無いため、常にクライアント申告どおりに扱う。
+function bucketForVisibility(env: Env, visibility: Visibility): R2Bucket {
+  return visibility === 'public' ? env.CONTENT : env.INTERNAL;
+}
+
 function validOrigin(request: Request, env: Env): boolean {
   return String(request.headers.get('origin') ?? '') === env.CONSOLE_ORIGIN;
 }
@@ -236,6 +253,7 @@ interface PageRow {
   object_key: string;
   page_date: string;
   updated_at: string;
+  visibility: string;
 }
 
 interface CommitPageInput {
@@ -249,6 +267,7 @@ interface CommitPageInput {
   updatedAt: string;
   bytes: number;
   md5: string;
+  visibility: Visibility;
 }
 
 // PUT側の入力検証。object_key・hrefはリクエストに含めない（Workerが導出するため、
@@ -279,6 +298,9 @@ function cleanCommitPages(value: unknown): CommitPageInput[] {
     if (!/^[0-9a-f]{32}$/.test(md5)) {
       throw Object.assign(new Error(`pages[${index}].md5 is invalid`), { statusCode: 400 });
     }
+    // 未指定・不正な値はfail-closedで'internal'側へ倒す（CLIの既定と揃える。
+    // 外部公開は'public'を明示した場合だけの opt-in）
+    const visibility: Visibility = page.visibility === 'public' ? 'public' : 'internal';
     return {
       slug,
       title: clean(page.title, `pages[${index}].title`, 200, true),
@@ -288,7 +310,7 @@ function cleanCommitPages(value: unknown): CommitPageInput[] {
       streamLabel: clean(page.streamLabel, `pages[${index}].streamLabel`, 100, true),
       date: clean(page.date, `pages[${index}].date`, 40, true),
       updatedAt: clean(page.updatedAt, `pages[${index}].updatedAt`, 40, true),
-      bytes, md5,
+      bytes, md5, visibility,
     };
   });
 }
@@ -298,12 +320,15 @@ function cleanCommitPages(value: unknown): CommitPageInput[] {
 // 防ぐのは事故（切断アップロード・誤バケット・別ファイルの取り違え・並行プロセスの
 // 残骸）であり、R2書き込み資格情報の保持者による悪意（正しいmd5と共に偽内容を
 // 置く攻撃）は防がない——upstreamから変わらない信頼境界であり、本設計の非ゴール。
-async function verifyUploadedPages(env: Env, deviceId: string, gen: string, pages: CommitPageInput[]): Promise<void> {
+async function verifyUploadedPages(
+  bucket: R2Bucket, deviceId: string, gen: string, pages: CommitPageInput[],
+): Promise<void> {
+  if (pages.length === 0) return;
   const prefix = `pages/${deviceId}/${gen}/`;
   const actual = new Map<string, { size: number; etag: string }>();
   let cursor: string | undefined;
   do {
-    const listed = await env.CONTENT.list({ prefix, cursor, limit: 1000 });
+    const listed = await bucket.list({ prefix, cursor, limit: 1000 });
     for (const object of listed.objects) actual.set(object.key, { size: object.size, etag: object.etag });
     cursor = listed.truncated ? listed.cursor : undefined;
   } while (cursor);
@@ -335,7 +360,7 @@ async function verifyUploadedPages(env: Env, deviceId: string, gen: string, page
 // （§4.4の多重防御。年齢条件だけで既に安全だが、lock喪失や別publishによる
 // gen更新が起きていたらそこでGCを打ち切る）。
 async function gcStaleGenerations(
-  env: Env, deviceId: string, currentGen: string, lockToken: string, now: number,
+  env: Env, bucket: R2Bucket, deviceId: string, currentGen: string, lockToken: string, now: number,
 ): Promise<number> {
   const maxAgeSeconds = Number(env.MAXIMUM_SHARE_DAYS) * 24 * 60 * 60;
   const budget = r2OperationBudget(env);
@@ -345,7 +370,7 @@ async function gcStaleGenerations(
   let operations = 0;
   do {
     if (operations >= budget) break;
-    const listed = await env.CONTENT.list({ prefix, cursor, limit: 1000 });
+    const listed = await bucket.list({ prefix, cursor, limit: 1000 });
     operations += 1;
     const staleKeys: string[] = [];
     for (const object of listed.objects) {
@@ -359,7 +384,7 @@ async function gcStaleGenerations(
         .bind(deviceId).first<{ token: string; gen: string }>();
       if (!guard || guard.token !== lockToken || guard.gen !== currentGen) return deleted;
       const batch = staleKeys.slice(index, index + 1000);
-      await env.CONTENT.delete(batch);
+      await bucket.delete(batch);
       operations += 1;
       deleted += batch.length;
     }
@@ -411,7 +436,8 @@ async function acquireDevicePublishLock(env: Env, deviceId: string, now: number)
 // 現在時刻を取り直しているか」を検証できるようにするための差し替え口。本番では
 // 常に既定値のまま使う）。
 export async function purgeDeviceObjects(
-  env: Env, deviceId: string, lockToken: string, nowFn: () => number = () => Math.floor(Date.now() / 1000),
+  env: Env, bucket: R2Bucket, deviceId: string, lockToken: string,
+  nowFn: () => number = () => Math.floor(Date.now() / 1000),
 ): Promise<{ done: boolean; remaining: number }> {
   const budget = r2OperationBudget(env);
   const prefix = `pages/${deviceId}/`;
@@ -421,7 +447,7 @@ export async function purgeDeviceObjects(
   let stopped = false; // budget超過またはlock喪失のいずれかで打ち切った
   do {
     if (operations >= budget) { stopped = true; break; }
-    const listed = await env.CONTENT.list({ prefix, cursor, limit: 1000 });
+    const listed = await bucket.list({ prefix, cursor, limit: 1000 });
     operations += 1;
     const keys = listed.objects.map((object) => object.key);
     for (let index = 0; index < keys.length; index += 1000) {
@@ -446,7 +472,7 @@ export async function purgeDeviceObjects(
         remaining += keys.length - index;
         break;
       }
-      await env.CONTENT.delete(batch);
+      await bucket.delete(batch);
       operations += 1;
     }
     cursor = listed.truncated ? listed.cursor : undefined;
@@ -525,9 +551,16 @@ async function handleShare(env: Env, deviceId: string, body: Record<string, any>
   if (!Number.isInteger(days) || days < 1 || days > maximumDays) {
     return json(env, 400, { error: `Share duration must be between 1 and ${maximumDays} days` });
   }
-  const row = await env.DB.prepare('SELECT object_key FROM pages WHERE device_id = ?1 AND slug = ?2')
-    .bind(deviceId, slug).first<{ object_key: string }>();
+  const row = await env.DB.prepare('SELECT object_key, visibility FROM pages WHERE device_id = ?1 AND slug = ?2')
+    .bind(deviceId, slug).first<{ object_key: string; visibility: string }>();
   if (!row) return json(env, 404, { error: 'Page not found' });
+  // このscope('public'|'internal')はCONTENTバケット上でのCIDR制限の有無を選ぶだけの軸で、
+  // ページ自体のvisibility（どのバケットに実在するか）とは別物。visibility='internal'な
+  // ページはCONTENTバケットに実体が無いため、scopeに関わらずここで拒否する
+  // （internal Worker限定のページを、うっかり外部共有できてしまわないための歯止め）
+  if (row.visibility === 'internal') {
+    return json(env, 400, { error: 'This page is internal-only and cannot be shared publicly' });
+  }
   const expiresAt = now + days * 24 * 60 * 60;
   const url = `${env.CONTENT_ORIGIN}/${row.object_key}`;
   let cidrs: string[] = [];
@@ -686,6 +719,10 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
          ORDER BY p.page_date DESC`,
       ).all<PageRow & { device_name: string }>();
       const ownerLinkExpiresAt = now + Number(env.OWNER_LINK_DAYS) * 24 * 60 * 60;
+      // visibility='internal'なページはINTERNAL_ORIGIN（Access限定）を平文で指すだけでよい。
+      // 署名URLの仕組み（期限・CIDR）はcontent Worker向けの「誰でも」モデルの
+      // ためのものであり、Accessが本人確認そのものを行うinternal側には不要
+      // （internal Worker自体はAccess JWTを都度検証するので、期限切れの心配も無い）
       const pages = await Promise.all((result.results ?? []).map(async (row) => ({
         slug: row.slug,
         title: row.title,
@@ -696,7 +733,10 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
         date: row.page_date,
         updatedAt: row.updated_at,
         objectKey: row.object_key,
-        href: await signShareUrl(env, `${env.CONTENT_ORIGIN}/${row.object_key}`, ownerLinkExpiresAt, []),
+        visibility: row.visibility,
+        href: row.visibility === 'internal'
+          ? `${env.INTERNAL_ORIGIN}/${row.object_key}`
+          : await signShareUrl(env, `${env.CONTENT_ORIGIN}/${row.object_key}`, ownerLinkExpiresAt, []),
         deviceId: row.device_id,
         deviceName: row.device_name,
       })));
@@ -729,7 +769,14 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
           env.DB.prepare('DELETE FROM pages WHERE device_id = ?1').bind(deviceId),
         ]);
       }
-      const result = await purgeDeviceObjects(env, deviceId, lock.token);
+      // deviceがpublicとinternal両方のページを持ち得るため、両バケットを毎回とも試みる
+      // （片方が予算切れで停止しても、もう片方は独立した予算で消化を試みる）
+      const contentResult = await purgeDeviceObjects(env, env.CONTENT, deviceId, lock.token);
+      const internalResult = await purgeDeviceObjects(env, env.INTERNAL, deviceId, lock.token);
+      const result = {
+        done: contentResult.done && internalResult.done,
+        remaining: contentResult.remaining + internalResult.remaining,
+      };
       if (!result.done) {
         await env.DB.prepare('DELETE FROM publish_locks WHERE device_id = ?1 AND token = ?2').bind(deviceId, lock.token).run();
         return json(env, 202, { done: false, ...(result.remaining ? { remaining: result.remaining } : {}) });
@@ -853,19 +900,29 @@ async function handleApi(request: Request, env: Env, path: string, now: number):
       ).bind(current.id, lockToken, now).first<{ gen: string }>();
       if (!lockRow) return json(env, 409, { error: 'Publish lock is not held' });
       const pages = cleanCommitPages(body.pages);
-      // ここで例外が投げられた場合はD1に一切触れていないため不変（§4.3 step2/3）
-      await verifyUploadedPages(env, current.id, lockRow.gen, pages);
+      // ここで例外が投げられた場合はD1に一切触れていないため不変（§4.3 step2/3）。
+      // visibilityごとに別バケットへアップロードされているため、検証も分けて行う
+      // （同じgen配下でも、片方のバケットにしか実在しないオブジェクトを他方の
+      // バケットへ問い合わせて誤って"missing"と判定しないようにする）
+      const publicPages = pages.filter((page) => page.visibility === 'public');
+      const internalPages = pages.filter((page) => page.visibility === 'internal');
+      await verifyUploadedPages(env.CONTENT, current.id, lockRow.gen, publicPages);
+      await verifyUploadedPages(env.INTERNAL, current.id, lockRow.gen, internalPages);
       await env.DB.batch([
         env.DB.prepare('DELETE FROM pages WHERE device_id = ?1').bind(current.id),
         ...pages.map((page) => env.DB.prepare(
-          `INSERT INTO pages (device_id, slug, title, source, repository, stream, stream_label, object_key, page_date, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+          `INSERT INTO pages (device_id, slug, title, source, repository, stream, stream_label, object_key, page_date, updated_at, visibility)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
         ).bind(
           current.id, page.slug, page.title, page.source, page.repository, page.stream, page.streamLabel,
-          pageObjectKey(current.id, lockRow.gen, page.slug), page.date, page.updatedAt,
+          pageObjectKey(current.id, lockRow.gen, page.slug), page.date, page.updatedAt, page.visibility,
         )),
       ]);
-      const gcDeleted = await gcStaleGenerations(env, current.id, lockRow.gen, lockToken, now);
+      // 両バケットとも毎回GCを試みる（このcommitがどちらのvisibilityも含まなくても、
+      // 過去の別世代の孤児が残っている可能性があるため）
+      const gcDeleted =
+        await gcStaleGenerations(env, env.CONTENT, current.id, lockRow.gen, lockToken, now)
+        + await gcStaleGenerations(env, env.INTERNAL, current.id, lockRow.gen, lockToken, now);
       await env.DB.prepare('DELETE FROM publish_locks WHERE device_id = ?1 AND token = ?2').bind(current.id, lockToken).run();
       return json(env, 200, { ok: true, pages: pages.length, gcDeleted });
     }

@@ -21,6 +21,8 @@ cloudflare:
   consoleDomain: console.example.com
   contentDomain: content.example.com
   contentBucket: html-share-content
+  internalDomain: internal.example.com
+  internalBucket: html-share-internal
   publicKeyPath: .html-share/keys/public.pem
   privateKeyPath: .html-share/keys/private.pem
 content:

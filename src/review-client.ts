@@ -145,6 +145,9 @@ export interface CommitPageInput {
   updatedAt: string;
   bytes: number;
   md5: string;
+  // 'public'=CONTENTバケット(content Worker、署名URLなら誰でも)、
+  // 'internal'=INTERNALバケット(internal Worker、Cloudflare Access限定)
+  visibility: 'public' | 'internal';
 }
 
 // 設計§4.3。object_keyはリクエストに含めない——Workerがlock行のgenとslugから導出する

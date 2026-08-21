@@ -61,6 +61,9 @@ export interface BuiltPage {
   // （publish.tsが行う）。ビルドはオフラインで完結しペアリング状態を要しないため、
   // ここではdeviceId/genを一切知らない。
   objectKey: string;
+  // publish.tsがどちらのバケット・R2認証情報でアップロードするかを決める
+  // （internal Worker新設）。バンドル処理自体はvisibilityに関わらず同じ
+  visibility: 'public' | 'internal';
 }
 
 export interface BuildManifest {
@@ -175,6 +178,7 @@ export function buildSite(config: HtmlShareConfig, buildRoot: string): BuildMani
       stream,
       streamLabel: page.streamLabel || stream,
       objectKey: `pages/${slug}/index.html`,
+      visibility: (page.visibility === 'public' ? 'public' : 'internal') as 'public' | 'internal',
     };
   });
   const manifest = { generatedAt: new Date().toISOString(), pages };

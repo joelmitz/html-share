@@ -1,6 +1,10 @@
 // Cloudflare Access が付与する JWT (Cf-Access-Jwt-Assertion) の検証。
 // Access はエッジで未認証アクセスを遮断するが、設定ミスで素通りした場合に
 // オーナーAPIが開かないよう、Worker 側でも二重に検証する。
+//
+// console・internal 両Workerで共有する（internal Worker新設時にworkers/console/src/
+// から移設）。モジュールスコープのcache（cachedKeys等）は各Workerが別isolateで動くため
+// Worker間で共有されない——このファイルを共有するのはコードの重複を避けるためだけ。
 
 interface AccessJwk {
   kid: string;

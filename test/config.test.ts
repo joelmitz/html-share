@@ -16,6 +16,8 @@ cloudflare:
   consoleDomain: console.example.com
   contentDomain: content.example.com
   contentBucket: html-share-content
+  internalDomain: internal.example.com
+  internalBucket: html-share-internal
   publicKeyPath: .html-share/keys/public.pem
   privateKeyPath: .html-share/keys/private.pem
 content:
@@ -42,6 +44,16 @@ test('loads a valid config and resolves its base directory', () => {
   assert.equal(loaded.content.pages[0].stream, 'release-notes');
   assert.equal(loaded.content.pages[0].streamLabel, 'リリースノート');
   assert.deepEqual(loaded.content.allowedInternalCidrs, ['203.0.113.0/24']);
+  assert.equal(loaded.cloudflare.internalDomain, 'internal.example.com');
+  assert.equal(loaded.cloudflare.internalBucket, 'html-share-internal');
+});
+
+// internal Worker新設: visibility未指定のページは、外部共有の誤opt-inを
+// 防ぐため既定で'internal'側へ倒す（fail-closed）
+test('defaults page visibility to internal when unspecified', () => {
+  const { config } = fixture();
+  const loaded = loadConfig(config);
+  assert.equal(loaded.content.pages[0].visibility, 'internal');
 });
 
 test('adds a page only once', () => {
@@ -51,11 +63,34 @@ test('adds a page only once', () => {
   assert.equal((readFileSync(config, 'utf8').match(/pages\/second\.html/g) ?? []).length, 1);
 });
 
+test('addPageToConfig writes visibility explicitly (internal by default, public on request)', () => {
+  const { config } = fixture();
+  addPageToConfig(config, 'pages/second.html', 'Second');
+  addPageToConfig(config, 'pages/third.html', 'Third', 'public');
+  const loaded = loadConfig(config);
+  const second = loaded.content.pages.find((page) => page.path.endsWith('second.html'));
+  const third = loaded.content.pages.find((page) => page.path.endsWith('third.html'));
+  assert.equal(second?.visibility, 'internal');
+  assert.equal(third?.visibility, 'public');
+});
+
 test('requires separate console and content origins', () => {
   const { config } = fixture();
   const source = readFileSync(config, 'utf8').replace('content.example.com', 'console.example.com');
   writeFileSync(config, source);
   assert.throws(() => loadConfig(config), /must be different security origins/);
+});
+
+test('requires internalDomain to be a separate security origin from console and content', () => {
+  const { config } = fixture();
+  const asConsole = readFileSync(config, 'utf8').replace('internal.example.com', 'console.example.com');
+  writeFileSync(config, asConsole);
+  assert.throws(() => loadConfig(config), /internalDomain must be a different security origin/);
+
+  const { config: config2 } = fixture();
+  const asContent = readFileSync(config2, 'utf8').replace('internal.example.com', 'content.example.com');
+  writeFileSync(config2, asContent);
+  assert.throws(() => loadConfig(config2), /internalDomain must be a different security origin/);
 });
 
 test('rejects invalid internal CIDRs', () => {
